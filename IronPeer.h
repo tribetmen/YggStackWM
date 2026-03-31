@@ -33,12 +33,14 @@ struct NodeRoute {
 // ОЖИДАЮЩАЯ СЕССИЯ (для асинхронной отправки SESSION_INIT после PATH_NOTIFY)
 // ============================================================================
 struct PendingSession {
-    BYTE targetKey[32];
+    BYTE targetKey[32];      // Partial key из IPv6
+    BYTE targetIPv6[16];     // Оригинальный IPv6 (для точного сравнения)
     int targetPort;
     DWORD createdTime;
     
-    PendingSession(const BYTE* key, int port) : targetPort(port), createdTime(GetTickCount()) {
+    PendingSession(const BYTE* key, const BYTE* ipv6, int port) : targetPort(port), createdTime(GetTickCount()) {
         memcpy(targetKey, key, 32);
+        memcpy(targetIPv6, ipv6, 16);
     }
 };
 
@@ -138,7 +140,7 @@ public:
     bool SendPathNotify(const BYTE* backPath, const BYTE* remoteNodeKey, const BYTE* realCoords);
     
     // Асинхронная работа с сессиями
-    void AddPendingSession(const BYTE* targetKey, int targetPort);
+    void AddPendingSession(const BYTE* targetKey, const BYTE* targetIPv6, int targetPort);
     void CheckPendingSessions(const string& prefix);
     void CheckPendingSessionsWithFullKey(const BYTE* fullKey, const vector<BYTE>& path);
     

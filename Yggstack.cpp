@@ -33,6 +33,7 @@
 // ID сообщений для потоков
 #define WM_CONNECT_COMPLETE    (WM_USER + 100)
 #define WM_CONNECT_FAILED      (WM_USER + 101)
+#define WM_PEER_DISCONNECTED   (WM_USER + 102)
 
 // Таймеры
 #define ID_TIMER_SCROLL        1001
@@ -371,6 +372,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             
         case WM_USER + 101: // WM_CONNECT_FAILED
             OnConnectFailed();
+            return 0;
+
+        case WM_USER + 102: // WM_PEER_DISCONNECTED — автопереподключение
+            if (g_serviceRunning) {
+                OnAutoReconnect(hWnd);
+            }
             return 0;
             
         case WM_ACTIVATE:

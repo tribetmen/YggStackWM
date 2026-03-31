@@ -15,6 +15,74 @@ extern "C" {
 #include "tweetnacl32.h"
 }
 
+// Парсинг IPv6 строки в байты (с поддержкой :: сокращения и квадратных скобок)
+static bool ParseIPv6String(LPCWSTR ipv6Str, BYTE* outBytes) {
+    // Обнуляем выходной буфер
+    for (int i = 0; i < 16; i++) outBytes[i] = 0;
+
+    const WCHAR* p = ipv6Str;
+
+    // Пропускаем квадратные скобки [2001:db8::1] -> 2001:db8::1
+    if (*p == L'[') p++;
+
+    unsigned short groups[8] = {0};
+    int groupCount = 0;
+    int doubleColonPos = -1;
+
+    // Парсим группы
+    while (*p && *p != L']' && groupCount < 8) {
+        if (*p == L':') {
+            if (groupCount == 0 && *(p+1) == L':') p++;
+
+            if (doubleColonPos >= 0) return false;
+
+            doubleColonPos = groupCount;
+            p++;
+            continue;
+        }
+
+        unsigned long val = 0;
+        int digits = 0;
+        while (digits < 4 && *p && *p != L':' && *p != L']') {
+            WCHAR c = *p++;
+            val <<= 4;
+            if (c >= L'0' && c <= L'9') val |= (c - L'0');
+            else if (c >= L'a' && c <= L'f') val |= (c - L'a' + 10);
+            else if (c >= L'A' && c <= L'F') val |= (c - L'A' + 10);
+            else return false;
+            digits++;
+        }
+
+        groups[groupCount++] = (unsigned short)val;
+
+        if (*p == L':') p++;
+        else if (*p == 0 || *p == L']') break;
+    }
+
+    // Если было ::, заполняем пропущенные нулями
+    if (doubleColonPos >= 0) {
+        int zerosToInsert = 8 - groupCount;
+        if (zerosToInsert < 0) return false;
+        for (int i = groupCount - 1; i >= doubleColonPos; i--)
+            groups[i + zerosToInsert] = groups[i];
+        for (int i = 0; i < zerosToInsert; i++)
+            groups[doubleColonPos + i] = 0;
+        groupCount = 8;
+    }
+
+    if (groupCount != 8) return false;
+
+    for (int i = 0; i < 8; i++) {
+        outBytes[i * 2]     = (groups[i] >> 8) & 0xFF;
+        outBytes[i * 2 + 1] = groups[i] & 0xFF;
+    }
+
+    // Нормализация: 300::/8 -> 200::/8
+    if (outBytes[0] == 0x03) outBytes[0] = 0x02;
+
+    return true;
+}
+
 // Статическая переменная Singleton
 CYggdrasilCore* CYggdrasilCore::s_pInstance = NULL;
 
@@ -351,38 +419,10 @@ IronPeer* CYggdrasilCore::GetFirstPeer() {
 // ============================================================================
 
 bool CYggdrasilCore::SendPathLookupToIPv6(LPCWSTR ipv6Address) {
-    // Парсим IPv6 строку в байты
+    // Парсим IPv6 строку в байты (с поддержкой :: сокращения)
     BYTE ipv6[16] = {0};
     
-    // Ручной парсинг hex IPv6 для надежности на WinCE
-    // Формат: xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx
-    const WCHAR* p = ipv6Address;
-    int group = 0;
-    
-    while (group < 8 && *p) {
-        unsigned long val = 0;
-        int digits = 0;
-        
-        // Парсим hex цифры вручную (максимум 4)
-        while (digits < 4 && *p && *p != L':') {
-            WCHAR c = *p++;
-            val <<= 4;
-            if (c >= L'0' && c <= L'9') val |= (c - L'0');
-            else if (c >= L'a' && c <= L'f') val |= (c - L'a' + 10);
-            else if (c >= L'A' && c <= L'F') val |= (c - L'A' + 10);
-            digits++;
-        }
-        
-        ipv6[group*2] = (val >> 8) & 0xFF;
-        ipv6[group*2+1] = val & 0xFF;
-        group++;
-        
-        // Пропускаем двоеточие или завершаем
-        if (*p == L':') p++;
-        else if (*p == 0) break;
-    }
-    
-    if (group != 8) {
+    if (!ParseIPv6String(ipv6Address, ipv6)) {
         AddLog(L"[PATH_LOOKUP] Invalid IPv6 format", LOG_ERROR);
         return false;
     }
@@ -394,9 +434,23 @@ bool CYggdrasilCore::SendPathLookupToIPv6(LPCWSTR ipv6Address) {
         ipv6[8], ipv6[9], ipv6[10], ipv6[11], ipv6[12], ipv6[13], ipv6[14], ipv6[15]);
     AddLog(parsedIp, LOG_DEBUG);
     
+    // DEBUG: Выводим все байты IPv6 с индексами
+    for (int i = 0; i < 16; i += 4) {
+        WCHAR bytesDebug[64];
+        wsprintf(bytesDebug, L"[PATH_LOOKUP] ipv6[%d..%d]: %02x %02x %02x %02x", 
+                 i, i+3, ipv6[i], ipv6[i+1], ipv6[i+2], ipv6[i+3]);
+        AddLog(bytesDebug, LOG_DEBUG);
+    }
+    
     // Получаем partial key из IPv6
     BYTE targetKey[32];
     YggCrypto::DerivePartialKeyFromIPv6(targetKey, ipv6);
+    
+    // DEBUG: Выводим ones и первые байты ключа до инверсии
+    int ones = ipv6[1];
+    WCHAR debugOnes[128];
+    wsprintf(debugOnes, L"[PATH_LOOKUP] ones=%d (from ipv6[1]=0x%02x)", ones, ipv6[1]);
+    AddLog(debugOnes, LOG_DEBUG);
     
     WCHAR debug[256];
     WCHAR keyHex[33] = {0};
@@ -427,35 +481,10 @@ bool CYggdrasilCore::SendPathLookupToIPv6(LPCWSTR ipv6Address) {
 }
 
 std::wstring CYggdrasilCore::SendPathLookupToIPv6WithKey(LPCWSTR ipv6Address, BYTE* outKey) {
-    // Парсим IPv6 строку в байты
+    // Парсим IPv6 строку в байты (с поддержкой :: сокращения)
     BYTE ipv6[16] = {0};
     
-    // Ручной парсинг hex IPv6 для надежности на WinCE
-    const WCHAR* p = ipv6Address;
-    int group = 0;
-    
-    while (group < 8 && *p) {
-        unsigned long val = 0;
-        int digits = 0;
-        
-        while (digits < 4 && *p && *p != L':') {
-            WCHAR c = *p++;
-            val <<= 4;
-            if (c >= L'0' && c <= L'9') val |= (c - L'0');
-            else if (c >= L'a' && c <= L'f') val |= (c - L'a' + 10);
-            else if (c >= L'A' && c <= L'F') val |= (c - L'A' + 10);
-            digits++;
-        }
-        
-        ipv6[group*2] = (val >> 8) & 0xFF;
-        ipv6[group*2+1] = val & 0xFF;
-        group++;
-        
-        if (*p == L':') p++;
-        else if (*p == 0) break;
-    }
-    
-    if (group != 8) {
+    if (!ParseIPv6String(ipv6Address, ipv6)) {
         return L"Invalid IPv6 format";
     }
     
@@ -604,33 +633,10 @@ bool CYggdrasilCore::CreateSessionToIPv6(LPCWSTR ipv6Address, int targetPort) {
 // ============================================================================
 
 void CYggdrasilCore::AddPendingSession(LPCWSTR ipv6Address, int targetPort) {
-    // Парсим IPv6 строку в байты
+    // Парсим IPv6 строку в байты (с поддержкой :: сокращения)
     BYTE ipv6[16] = {0};
-    const WCHAR* p = ipv6Address;
-    int group = 0;
     
-    while (group < 8 && *p) {
-        unsigned long val = 0;
-        int digits = 0;
-        
-        while (digits < 4 && *p && *p != L':') {
-            WCHAR c = *p++;
-            val <<= 4;
-            if (c >= L'0' && c <= L'9') val |= (c - L'0');
-            else if (c >= L'a' && c <= L'f') val |= (c - L'a' + 10);
-            else if (c >= L'A' && c <= L'F') val |= (c - L'A' + 10);
-            digits++;
-        }
-        
-        ipv6[group*2] = (val >> 8) & 0xFF;
-        ipv6[group*2+1] = val & 0xFF;
-        group++;
-        
-        if (*p == L':') p++;
-        else if (*p == 0) break;
-    }
-    
-    if (group != 8) {
+    if (!ParseIPv6String(ipv6Address, ipv6)) {
         AddLog(L"[PENDING] Invalid IPv6 format", LOG_ERROR);
         return;
     }
@@ -659,28 +665,12 @@ void CYggdrasilCore::AddPendingSession(LPCWSTR ipv6Address, int targetPort) {
         return;
     }
     
-    // Добавляем в ожидающие
-    peer->AddPendingSession(targetKey, targetPort);
+    // Добавляем в ожидающие (передаём и ключ, и оригинальный IPv6)
+    peer->AddPendingSession(targetKey, ipv6, targetPort);
     
     WCHAR debug[256];
     wsprintf(debug, L"[PENDING] Session added for %S", prefix);
     AddLog(debug, LOG_SUCCESS);
-}
-
-// Парсинг IPv6 строки в байты
-static bool ParseIPv6String(LPCWSTR ipv6Str, BYTE* outBytes) {
-    // Простой парсер для форматов типа 200:4caa:b3ab:d620:b940:1d43:dc54:4a94
-    int values[8] = {0};
-    int count = swscanf(ipv6Str, L"%x:%x:%x:%x:%x:%x:%x:%x", 
-                        &values[0], &values[1], &values[2], &values[3],
-                        &values[4], &values[5], &values[6], &values[7]);
-    if (count != 8) return false;
-    
-    for (int i = 0; i < 8; i++) {
-        outBytes[i * 2] = (values[i] >> 8) & 0xFF;
-        outBytes[i * 2 + 1] = values[i] & 0xFF;
-    }
-    return true;
 }
 
 // Получение сессии по IPv6 (для HTTP прокси)

@@ -38,20 +38,20 @@ struct ConnectParams {
 // Поток подключения
 static DWORD WINAPI ConnectThreadProc(LPVOID lpParam) {
     ConnectParams* params = (ConnectParams*)lpParam;
-    
+
     if (!g_pYggCore) {
         g_pYggCore = CYggdrasilCore::GetInstance();
     }
-    
+
     IronPeer* peer = g_pYggCore->ConnectToPeer(params->peerAddress, params->port);
-    
+
     if (peer) {
         g_pCurrentPeer = peer;
         PostMessage(params->hWnd, WM_USER + 100, 0, 0); // WM_CONNECT_COMPLETE
     } else {
         PostMessage(params->hWnd, WM_USER + 101, 0, 0); // WM_CONNECT_FAILED
     }
-    
+
     delete params;
     return 0;
 }
@@ -116,6 +116,31 @@ void OnConnectFailed() {
     }
     
     InvalidateRect(g_hWnd, NULL, TRUE);
+}
+
+void OnAutoReconnect(HWND hWnd) {
+    if (g_connecting) return; // уже переподключаемся
+
+    AddLog(L"[Reconnect] Peer disconnected, reconnecting...", LOG_WARN);
+
+    // Очищаем старое соединение
+    if (g_pYggCore) g_pYggCore->DisconnectAll();
+    g_pCurrentPeer = NULL;
+    g_serviceRunning = FALSE;
+
+    if (g_peerCount == 0) return;
+
+    g_connecting = TRUE;
+    g_showSpinner = TRUE;
+    SetTimer(hWnd, ID_TIMER_SPINNER, 50, NULL);
+    InvalidateRect(hWnd, NULL, TRUE);
+
+    ConnectParams* params = new ConnectParams;
+    params->hWnd = hWnd;
+    wcscpy(params->peerAddress, g_peersList[0]);
+    params->port = 7991; // перекрывается портом из адреса
+
+    g_hConnectThread = CreateThread(NULL, 0, ConnectThreadProc, params, 0, NULL);
 }
 
 void DisconnectAll() {

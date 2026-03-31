@@ -181,16 +181,31 @@ void CYggHttpProxy::HandleClient(SOCKET clientSocket) {
         WCHAR ipv6Str[64];
         MultiByteToWideChar(CP_ACP, 0, host, -1, ipv6Str, 64);
         
-        // Проверяем, есть ли уже сессия (для переиспользования)
-        IronSession* existingSession = m_pCore->GetSessionForIPv6(ipv6Str);
-        if (existingSession) {
-            if (existingSession->IsReady()) {
-                AddLog(L"[HTTP] Reusing existing session", LOG_DEBUG);
-                RelayThroughSession(clientSocket, existingSession, ipv6Str, port, buffer, totalReceived, isConnect);
-                existingSession->Release();
-                return;
+        // Проверяем, есть ли уже свободная сессия (для переиспользования)
+        // Если сессия занята другим HTTP-потоком — ждём освобождения (до 30 сек)
+        IronSession* existingSession = NULL;
+        for (int waitIdx = 0; waitIdx < 300; waitIdx++) {
+            IronSession* candidate = m_pCore->GetSessionForIPv6(ipv6Str);
+            if (!candidate) break; // Нет сессии — идём создавать новую
+            if (candidate->IsReady() && candidate->TryAcquireUse()) {
+                existingSession = candidate; // Захватили
+                break;
             }
-            existingSession->Release(); // Не ready, отпускаем и идем дальше
+            candidate->Release();
+            if (waitIdx == 0) AddLog(L"[HTTP] Session busy, waiting for free slot", LOG_DEBUG);
+            Sleep(100);
+        }
+        if (existingSession) {
+            // Если TCP не активна — сбрасываем и переиспользуем Ironwood-туннель
+            if (existingSession->GetTcpState() == TCP_CLOSED ||
+                existingSession->GetTcpState() == TCP_FIN_WAIT) {
+                existingSession->ResetTcpState();
+            }
+            AddLog(L"[HTTP] Reusing existing session", LOG_DEBUG);
+            RelayThroughSession(clientSocket, existingSession, ipv6Str, port, buffer, totalReceived, isConnect);
+            existingSession->ReleaseUse();
+            existingSession->Release();
+            return;
         }
         
         if (!m_pCore->SendPathLookupToIPv6(ipv6Str)) {
@@ -203,25 +218,26 @@ void CYggHttpProxy::HandleClient(SOCKET clientSocket) {
         
         IronSession* session = NULL;
         for (int i = 0; i < 150; i++) {
-            session = m_pCore->GetSessionForIPv6(ipv6Str);
-            if (session && session->IsReady()) {
-                break; // Сессия криптографически готова, выходим из ожидания
+            IronSession* candidate = m_pCore->GetSessionForIPv6(ipv6Str);
+            if (candidate && candidate->IsReady() && candidate->TryAcquireUse()) {
+                session = candidate;
+                break; // Сессия готова и захвачена нами
             }
-            if (session) {
-                session->Release();
+            if (candidate) {
+                candidate->Release();
             }
-            session = NULL;
             Sleep(100);
         }
-        
+
         if (!session) {
             const char* err = "HTTP/1.1 504 Gateway Timeout\r\n\r\nSession timeout";
             send(clientSocket, err, strlen(err), 0);
             return;
         }
-        
+
         RelayThroughSession(clientSocket, session, ipv6Str, port, buffer, totalReceived, isConnect);
-        
+
+        session->ReleaseUse();
         // Освобождаем ссылку на сессию (крипто-туннель остается жить в Core)
         session->Release();
         return;
@@ -238,13 +254,47 @@ void CYggHttpProxy::HandleClient(SOCKET clientSocket) {
         addr.sin_family = AF_INET;
         addr.sin_port = htons((u_short)port);
         memcpy(&addr.sin_addr, hostent->h_addr, hostent->h_length);
-        if (connect(targetSocket, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) { closesocket(targetSocket); return; }
+        // Неблокирующий connect с таймаутом 10 секунд
+        u_long nonBlock = 1;
+        ioctlsocket(targetSocket, FIONBIO, &nonBlock);
+        connect(targetSocket, (struct sockaddr*)&addr, sizeof(addr));
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(targetSocket, &wfds);
+        struct timeval ctv;
+        ctv.tv_sec = 10;
+        ctv.tv_usec = 0;
+        if (select(0, NULL, &wfds, NULL, &ctv) <= 0 || !FD_ISSET(targetSocket, &wfds)) {
+            closesocket(targetSocket);
+            return;
+        }
+        nonBlock = 0;
+        ioctlsocket(targetSocket, FIONBIO, &nonBlock);
         
         if (isConnect) {
             const char* ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
             send(clientSocket, ok, strlen(ok), 0);
         } else {
-            send(targetSocket, buffer, totalReceived, 0);
+            // Переписываем первую строку: "GET http://host/path" -> "GET /path"
+            // Находим конец первой строки
+            const char* crlf = strstr(buffer, "\r\n");
+            if (crlf) {
+                // Строим новый запрос: method + " " + path + " HTTP/1.0\r\n" + остаток заголовков
+                char newRequest[PROXY_BUFFER_SIZE];
+                int newLen = 0;
+                // method + space + path
+                newLen += sprintf(newRequest + newLen, "%s %s HTTP/1.0\r\n", method, path);
+                // остаток заголовков (после первой строки)
+                const char* rest = crlf + 2;
+                int restLen = totalReceived - (int)(rest - buffer);
+                if (restLen > 0 && newLen + restLen < PROXY_BUFFER_SIZE) {
+                    memcpy(newRequest + newLen, rest, restLen);
+                    newLen += restLen;
+                }
+                send(targetSocket, newRequest, newLen, 0);
+            } else {
+                send(targetSocket, buffer, totalReceived, 0);
+            }
         }
         RelayData(clientSocket, targetSocket);
         closesocket(targetSocket);
@@ -319,6 +369,34 @@ bool CYggHttpProxy::ParseRequest(const char* request, char* method, char* host, 
         }
         return true;
     }
+
+    // Относительный путь: GET /path HTTP/1.1 + заголовок Host:
+    // Ищем Host: в заголовках
+    const char* hostHeader = strstr(request, "\r\nHost:");
+    if (!hostHeader) hostHeader = strstr(request, "\r\nhost:");
+    if (hostHeader) {
+        hostHeader += 7; // пропускаем "\r\nHost:"
+        while (*hostHeader == ' ') hostHeader++;
+        char hostBuf[256];
+        int hi = 0;
+        while (*hostHeader && *hostHeader != '\r' && *hostHeader != '\n' && hi < 255)
+            hostBuf[hi++] = *hostHeader++;
+        hostBuf[hi] = '\0';
+        // Разделяем host:port
+        char* portDiv = strchr(hostBuf, ':');
+        if (portDiv) {
+            *portDiv = '\0';
+            strcpy(host, hostBuf);
+            *port = atoi(portDiv + 1);
+        } else {
+            strcpy(host, hostBuf);
+            *port = 80;
+        }
+        // path — сам urlStr (уже обрезан до пробела)
+        strcpy(path, urlStr);
+        return true;
+    }
+
     return false;
 }
 
@@ -381,26 +459,22 @@ void CYggHttpProxy::RelayThroughSession(SOCKET clientSocket, IronSession* sessio
     vector<BYTE> path;
     if (!m_pCore->GetPathToIPv6(ipv6, path)) return;
     
-    // Сбрасываем TCP только если сессия закрыта или в FIN_WAIT.
-    // Если сессия ESTABLISHED - используем её для переиспользования соединения.
-    TcpState currentState = session->GetTcpState();
-    if (currentState == TCP_CLOSED || currentState == TCP_FIN_WAIT) {
-        session->ResetTcpState();
-    } else if (currentState == TCP_ESTABLISHED) {
-        AddLog(L"[HTTP] Reusing existing ESTABLISHED session", LOG_DEBUG);
-    }
-    
-    // Отправляем SYN только если соединение не установлено
-    if (session->GetTcpState() != TCP_ESTABLISHED) {
+    // Сессия захвачена эксклюзивно через TryAcquireUse — всегда TCP_CLOSED здесь.
+    // Отправляем SYN и ждём ESTABLISHED.
+    if (session->GetTcpState() == TCP_CLOSED || session->GetTcpState() == TCP_FIN_WAIT) {
         session->SendSYN(peer, path);
         int waitCount = 0;
-        while (waitCount < 50 && session->GetTcpState() != TCP_ESTABLISHED) {
+        while (waitCount < 150 && session->GetTcpState() != TCP_ESTABLISHED && peer->IsConnected()) {
             Sleep(100);
             waitCount++;
         }
+    } else {
+        AddLog(L"[HTTP] Session already ESTABLISHED", LOG_DEBUG);
     }
     
     if (session->GetTcpState() != TCP_ESTABLISHED) {
+        // Сбрасываем состояние чтобы следующий поток мог начать новое подключение
+        session->ResetTcpState();
         const char* err = "HTTP/1.1 504 Gateway Timeout\r\n\r\nVirtual TCP failed";
         send(clientSocket, err, strlen(err), 0);
         return;
@@ -413,29 +487,49 @@ void CYggHttpProxy::RelayThroughSession(SOCKET clientSocket, IronSession* sessio
         const char* ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
         send(clientSocket, ok, strlen(ok), 0);
     } else if (initialData && initialLen > 0) {
-        // Теперь эти 708 байт гарантированно отправятся, так как статус = TCP_ESTABLISHED
-        session->QueueOrSendData(peer, path, (BYTE*)initialData, initialLen);
+        // Переписываем первую строку: "GET http://host/path" -> "GET /path"
+        const char* crlf = strstr(initialData, "\r\n");
+        if (crlf) {
+            char method2[16], host2[256], path2[1024];
+            int port2 = 80;
+            bool isConn2 = false;
+            char newReq[PROXY_BUFFER_SIZE];
+            int newLen = 0;
+            if (ParseRequest(initialData, method2, host2, &port2, path2, &isConn2) && !isConn2) {
+                newLen += sprintf(newReq + newLen, "%s %s HTTP/1.0\r\n", method2, path2);
+                const char* rest = crlf + 2;
+                int restLen = initialLen - (int)(rest - initialData);
+                if (restLen > 0 && newLen + restLen < PROXY_BUFFER_SIZE) {
+                    memcpy(newReq + newLen, rest, restLen);
+                    newLen += restLen;
+                }
+                session->QueueOrSendData(peer, path, (BYTE*)newReq, newLen);
+            } else {
+                session->QueueOrSendData(peer, path, (BYTE*)initialData, initialLen);
+            }
+        } else {
+            session->QueueOrSendData(peer, path, (BYTE*)initialData, initialLen);
+        }
     }
     
     char buffer[PROXY_BUFFER_SIZE];
     fd_set fdset;
     DWORD lastActivity = GetTickCount();
-    DWORD sessionStartTime = GetTickCount(); // Жесткий таймаут 30 сек на всю сессию
-    
+
     while (m_bRunning) {
-        // Жесткий таймаут 30 секунд - защита от зависших сессий
-        if (GetTickCount() - sessionStartTime > 30000) {
-            AddLog(L"[HTTP] Hard session timeout (30s), closing", LOG_WARN);
+        if (!peer->IsConnected()) {
+            AddLog(L"[HTTP] Peer disconnected, closing relay", LOG_WARN);
             break;
         }
+
         FD_ZERO(&fdset);
         FD_SET(clientSocket, &fdset);
         struct timeval tv;
         tv.tv_sec = 0;
         tv.tv_usec = 10000;
-        
+
         int result = select(0, &fdset, NULL, NULL, &tv);
-        
+
         if (result > 0 && FD_ISSET(clientSocket, &fdset)) {
             int received = recv(clientSocket, buffer, sizeof(buffer), 0);
             if (received > 0) {
@@ -452,7 +546,7 @@ void CYggHttpProxy::RelayThroughSession(SOCKET clientSocket, IronSession* sessio
                 }
             }
         }
-        
+
         DWORD recvLen = 0;
         BYTE recvBuffer[PROXY_BUFFER_SIZE];
         if (session->ReadData(recvBuffer, sizeof(recvBuffer), recvLen, 0)) {
@@ -462,16 +556,15 @@ void CYggHttpProxy::RelayThroughSession(SOCKET clientSocket, IronSession* sessio
                 lastActivity = GetTickCount();
             }
         } else {
-            // Как только сервер прислал флаг FIN и мы отдали все данные браузеру, закрываем сокет.
-            // Браузер моментально отобразит загруженную страницу без зависаний.
+            // Сервер прислал FIN и все данные отданы — закрываем туннель
             if (session->GetTcpState() == TCP_FIN_WAIT || session->GetTcpState() == TCP_CLOSED) {
                 AddLog(L"[HTTP] Remote server sent FIN. Page loaded. Closing tunnel.", LOG_SUCCESS);
                 break;
             }
         }
-        
-        if (GetTickCount() - lastActivity > 30000) {
-            AddLog(L"[HTTP] Relay timeout over session", LOG_WARN);
+
+        if (GetTickCount() - lastActivity > RELAY_TIMEOUT_MS) {
+            AddLog(L"[HTTP] Relay inactivity timeout, closing", LOG_WARN);
             break;
         }
     }

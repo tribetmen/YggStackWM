@@ -61,8 +61,9 @@ void YggCrypto::DeriveIPv6(BYTE* ipv6, const BYTE* pubKey) {
     
     // Формируем IPv6
     memset(ipv6, 0, 16);
-    ipv6[0] = 0x02;
-    ipv6[1] = (BYTE)ones;
+    // Первый байт: 0x02 + старшие биты ones (если ones >= 8, бит 8 попадает в бит 0 addr[0])
+    ipv6[0] = 0x02 | ((ones >> 8) & 0x01);
+    ipv6[1] = (BYTE)(ones & 0xFF);
     
     int keyStartBit = ones + 1;
     for(int i = keyStartBit; i < 256; i++) {
@@ -80,33 +81,39 @@ void YggCrypto::DeriveIPv6(BYTE* ipv6, const BYTE* pubKey) {
 
 void YggCrypto::DerivePartialKeyFromIPv6(BYTE* key, const BYTE* ipv6) {
     if (!key || !ipv6) return;
-    
-    // Получаем ones из ipv6[1]
-    int ones = ipv6[1];
-    
-    // Инициализируем ключ нулями
-    memset(key, 0, 32);
-    
-    // Устанавливаем ведущие единицы (ones)
+
+    // Адреса подсети 300::/8 (ipv6[0] == 0x03) нормализуем к Node IP 200::/8 (0x02)
+    // Протокол Yggdrasil: подсеть /64 узла отличается только первым байтом
+    BYTE normIpv6[16];
+    memcpy(normIpv6, ipv6, 16);
+    if (normIpv6[0] == 0x03) normIpv6[0] = 0x02;
+    ipv6 = normIpv6;
+
+    // ones хранится в ipv6[1], плюс возможный бит 8 в бите 0 ipv6[0]
+    int ones = ipv6[1] | ((ipv6[0] & 0x01) << 8);
+
+    // Строим инвертированный ключ (inv): ones единиц, затем 0, затем payload из IPv6
+    BYTE inv[32];
+    memset(inv, 0, 32);
+
+    // Ставим ones ведущих единиц
     for (int i = 0; i < ones; i++) {
-        key[i / 8] |= (0x80 >> (i % 8));
+        inv[i / 8] |= (0x80 >> (i % 8));
     }
-    
-    // Копируем биты из IPv6 обратно в ключ
-    // IPv6 биты 16-127 -> key биты (ones+1) и далее
-    int keyStartBit = ones + 1;
-    for (int i = 16; i < 128; i++) {
-        if ((ipv6[i / 8] & (0x80 >> (i % 8))) != 0) {
-            int kPos = keyStartBit + (i - 16);
-            if (kPos < 256) {
-                key[kPos / 8] |= (0x80 >> (kPos % 8));
-            }
+    // Бит (ones) остаётся нулём — это разделитель
+
+    // Копируем payload: биты IPv6 начиная с бита 16 → inv начиная с бита (ones+1)
+    for (int addrBit = 16; addrBit < 128; addrBit++) {
+        int kPos = ones + 1 + (addrBit - 16);
+        if (kPos >= 256) break;
+        if ((ipv6[addrBit / 8] & (0x80 >> (addrBit % 8))) != 0) {
+            inv[kPos / 8] |= (0x80 >> (kPos % 8));
         }
     }
-    
-    // Инвертируем ключ (как в Java: key[i] = (byte) ~key[i])
+
+    // Инвертируем обратно чтобы получить реальный ключ
     for (int i = 0; i < 32; i++) {
-        key[i] = ~key[i];
+        key[i] = ~inv[i];
     }
 }
 

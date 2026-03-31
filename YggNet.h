@@ -5,6 +5,7 @@
 void OnStartService();
 void OnConnectComplete();
 void OnConnectFailed();
+void OnAutoReconnect(HWND hWnd);
 void DisconnectAll();
 BOOL InitWinsock();
 

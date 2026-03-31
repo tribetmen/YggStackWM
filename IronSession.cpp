@@ -85,28 +85,34 @@ DWORD WINAPI IronSession::KeyPoolBackgroundThreadProc(LPVOID lpParam) {
             continue;
         }
         
-        // Нужно сгенерировать ключ
-        // Находим свободный слот (где used == false)
+        // Ищем слот для нового ключа:
+        // - used=true означает "выдан, слот свободен для генерации нового"
+        // - pub[0]==0 означает "незаполненный слот (никогда не инициализировался)"
         int slot = -1;
         EnterCriticalSection(&s_keyPoolLock);
         for (int j = 0; j < PRECOMPUTED_KEY_POOL_SIZE; j++) {
-            if (!s_keyPool[j].used) {
+            if (s_keyPool[j].used || s_keyPool[j].pub[0] == 0) {
                 slot = j;
+                // Обнуляем чтобы GetPrecomputedKeyPair не выдал этот слот пока генерируем
+                memset(s_keyPool[slot].pub, 0, 32);
+                memset(s_keyPool[slot].priv, 0, 32);
+                s_keyPool[slot].used = true;  // помечаем как "в работе"
                 break;
             }
         }
         LeaveCriticalSection(&s_keyPoolLock);
-        
+
         if (slot < 0) {
-            // Нет свободных слотов - спим
+            // Все слоты заняты готовыми ключами — спим
             Sleep(1000);
             continue;
         }
-        
-        // Генерируем ключ с низким приоритетом (даем время другим потокам)
+
+        // Генерируем ключ вне критической секции (медленная операция)
         BYTE tempPub[32], tempPriv[32];
         crypto_box_keypair(tempPub, tempPriv);
-        
+
+        // Записываем готовый ключ и помечаем как доступный
         EnterCriticalSection(&s_keyPoolLock);
         memcpy(s_keyPool[slot].pub, tempPub, 32);
         memcpy(s_keyPool[slot].priv, tempPriv, 32);
@@ -141,7 +147,7 @@ bool IronSession::GetPrecomputedKeyPair(BYTE* outPub, BYTE* outPriv) {
     }
 
     for (int i = 0; i < PRECOMPUTED_KEY_POOL_SIZE; i++) {
-        if (!s_keyPool[i].used) {
+        if (!s_keyPool[i].used && s_keyPool[i].pub[0] != 0) {
             memcpy(outPub, s_keyPool[i].pub, 32);
             memcpy(outPriv, s_keyPool[i].priv, 32);
             s_keyPool[i].used = true;
@@ -186,7 +192,7 @@ void IronSession::ShutdownKeyPool() {
 #define MAX_DECRYPTION_ERRORS       3
 #define MAX_REASSEMBLY_SIZE         (512 * 1024)  // 512KB
 #define REASSEMBLY_TIMEOUT          2000          // 2 seconds
-#define KEY_ROTATION_INTERVAL       300000        // 5 minutes (300 seconds) for Pocket PC
+#define KEY_ROTATION_INTERVAL       60000         // 60 seconds minimum between rotations (matches Go: time.Minute)
 #define MAX_SEQ_JUMP                32768
 
 #define CORE_TYPE_TRAFFIC           0x01
@@ -317,7 +323,9 @@ IronSession::IronSession(const BYTE* remoteKey, int targetPort, unsigned long lo
     
     m_bReady = false;
     m_bClosed = false;
+    m_inUse = false;
     m_lastRotation = 0;
+    m_lastActivity = GetTickCount();
     m_decryptionErrors = 0;
     
     m_reassemblyBufferSize = 0;
@@ -436,6 +444,7 @@ void IronSession::Cleanup() {
     EnterCriticalSection(&m_lock);
     m_reassemblyBuffer.clear();
     m_reassemblyBufferSize = 0;
+    m_earlyRecvData.clear();
     m_pendingData.clear();
     m_tcpState = TCP_CLOSED;
     m_dupAckCount = 0;
@@ -457,11 +466,51 @@ void IronSession::Cleanup() {
 // СБРОС TCP ДЛЯ ПОВТОРНОГО ИСПОЛЬЗОВАНИЯ IRONWOOD-СЕССИИ
 // ============================================================================
 
+// Атомарно: если сессия в CLOSED/FIN_WAIT — сбрасывает и возвращает true (поток-инициатор SYN).
+// Если уже SYN_SENT/ESTABLISHED — возвращает false (другой поток занимается).
+bool IronSession::TryClaimSynInitiator() {
+    EnterCriticalSection(&m_lock);
+    TcpState st = m_tcpState;
+    // Также захватываем если SYN_SENT но m_synSent=false (не должно быть, но на всякий случай)
+    bool claimed = (st == TCP_CLOSED || st == TCP_FIN_WAIT);
+    if (claimed) {
+        // Сбрасываем состояние; m_synSent и TCP_SYN_SENT выставит SendSYN
+        m_tcpState = TCP_CLOSED;
+        m_synSent = false;
+        m_bClosed = false;
+        m_localSeq = GetTickCount();
+        m_remoteSeq = 0;
+        m_remoteAck = 0;
+        m_nextExpectedSeq = 0;
+        m_sourcePort = (GetTickCount() % 60000) + 1024;
+        m_reassemblyBuffer.clear();
+        m_reassemblyBufferSize = 0;
+        m_earlyRecvData.clear();
+        m_oldestBufferedTime = 0;
+        m_dupAckCount = 0;
+        m_pendingData.clear();
+        // Сразу помечаем SYN_SENT чтобы конкурентные потоки не прошли сюда
+        m_tcpState = TCP_SYN_SENT;
+        m_synSent = true;
+    }
+    LeaveCriticalSection(&m_lock);
+
+    if (claimed) {
+        EnterCriticalSection(&m_recvQueueLock);
+        m_recvQueue.clear();
+        LeaveCriticalSection(&m_recvQueueLock);
+        AddLog(L"[SESSION] TCP state claimed for reuse", LOG_DEBUG);
+    }
+    return claimed;
+}
+
 void IronSession::ResetTcpState() {
     // Сбрасываем только TCP-стек — Ironwood-криптография остаётся нетронутой
     EnterCriticalSection(&m_lock);
     m_tcpState = TCP_CLOSED;
     m_synSent = false;
+    m_bClosed = false;
+    // m_inUse намеренно НЕ сбрасывается здесь — управляется только через TryAcquireUse/ReleaseUse
     m_localSeq = GetTickCount();   // новый ISN
     m_remoteSeq = 0;
     m_remoteAck = 0;
@@ -469,6 +518,7 @@ void IronSession::ResetTcpState() {
     m_sourcePort = (GetTickCount() % 60000) + 1024;  // новый source port
     m_reassemblyBuffer.clear();
     m_reassemblyBufferSize = 0;
+    m_earlyRecvData.clear();
     m_oldestBufferedTime = 0;
     m_dupAckCount = 0;
     m_pendingData.clear();
@@ -543,16 +593,16 @@ bool IronSession::SendSessionInit(IronPeer* peer, const vector<BYTE>& path) {
         AddLog(L"[SESSION] SendSessionInit: peer is NULL!", LOG_ERROR);
         return false;
     }
-    
+
     EnterCriticalSection(&m_lock);
-    
+
     if (m_bClosed) {
         LeaveCriticalSection(&m_lock);
         return false;
     }
-    
+
     DWORD initStart = GetTickCount();
-    
+
     // Формируем эфемерную пару ключей для handshake (из пула!)
     BYTE ephPriv[32], ephPub[32];
     DWORD kpStart = GetTickCount();
@@ -639,9 +689,9 @@ bool IronSession::SendSessionInit(IronPeer* peer, const vector<BYTE>& path) {
     // В 100-наносекундных интервалах это: 11644473600 * 10 000 000
     ll -= 116444736000000000ULL;
 
-    // 5. Конвертируем 100-наносекундные интервалы в МИКРОСЕКУНДЫ (деление на 10)
-    // Yggdrasil v0.4+ требует именно микросекунды
-    unsigned long long timestamp = ll / 10ULL;
+    // 5. Конвертируем 100-наносекундные интервалы в СЕКУНДЫ (деление на 10,000,000)
+    // Go: time.Now().Unix() — секунды с Unix epoch
+    unsigned long long timestamp = ll / 10000000ULL;
     
     // Формируем буфер для подписи (112 байт): ephPub + sendPub + nextPub + keySeq + timestamp
     BYTE toSign[112];
@@ -778,7 +828,9 @@ bool IronSession::SendSessionAck(IronPeer* peer, const vector<BYTE>& path) {
     
     // Аналогично INIT, но с типом SESSION_ACK
     BYTE ephPriv[32], ephPub[32];
-    crypto_box_keypair(ephPub, ephPriv);
+    if (!GetPrecomputedKeyPair(ephPub, ephPriv)) {
+        crypto_box_keypair(ephPub, ephPriv);
+    }
     
     CYggdrasilCore* core = CYggdrasilCore::GetInstance();
     const BYTE* ourEdPub = core->GetKeys().publicKey;
@@ -799,9 +851,9 @@ bool IronSession::SendSessionAck(IronPeer* peer, const vector<BYTE>& path) {
     // В 100-наносекундных интервалах это: 11644473600 * 10 000 000
     ll -= 116444736000000000ULL;
 
-    // 5. Конвертируем 100-наносекундные интервалы в МИКРОСЕКУНДЫ (деление на 10)
-    // Yggdrasil v0.4+ требует именно микросекунды
-    unsigned long long timestamp = ll / 10ULL;
+    // 5. Конвертируем 100-наносекундные интервалы в СЕКУНДЫ (деление на 10,000,000)
+    // Go: time.Now().Unix() — секунды с Unix epoch
+    unsigned long long timestamp = ll / 10000000ULL;
     
     // Формируем буфер для подписи (112 байт): ephPub + sendPub + nextPub + keySeq + timestamp
     BYTE toSign[112];
@@ -870,8 +922,20 @@ bool IronSession::SendSessionAck(IronPeer* peer, const vector<BYTE>& path) {
     packet.insert(packet.end(), ephPub, ephPub + 32);
     packet.insert(packet.end(), ciphertext.begin(), ciphertext.end());
     
+    // --- Добавляем фрейминг TCP (Uvarint длина пакета) ---
+    vector<BYTE> framedPacket;
+    DWORD packetLen = packet.size();
+    
+    while (packetLen >= 0x80) {
+        framedPacket.push_back((BYTE)((packetLen & 0x7F) | 0x80));
+        packetLen >>= 7;
+    }
+    framedPacket.push_back((BYTE)packetLen);
+    
+    framedPacket.insert(framedPacket.end(), packet.begin(), packet.end());
+    
     LeaveCriticalSection(&m_lock);
-    return peer->SendPacketRaw(&packet[0], packet.size());
+    return peer->SendPacketRaw(&framedPacket[0], framedPacket.size());
 }
 
 // ============================================================================
@@ -954,6 +1018,35 @@ bool IronSession::HandleSessionHandshake(const BYTE* packet, DWORD len, int sess
     
     EnterCriticalSection(&m_lock);
     
+    // Если TCP уже ESTABLISHED и пришёл INIT с теми же ключами — это ретрансмит,
+    // просто отправляем ACK без ротации. Если ключи другие — сервер переинициализировался,
+    // нужно принять новые ключи (TCP при этом сбросится при следующем запросе).
+    if (m_tcpState == TCP_ESTABLISHED) {
+        if (sessionType == SESSION_INIT) {
+            if (memcmp(m_remoteCurrentPub, remoteCurrentPub, 32) == 0) {
+                // Те же ключи — просто ACK
+                LeaveCriticalSection(&m_lock);
+                NodeRoute* route = peer->GetRoute(peer->GetKeyPrefix(srcKey));
+                vector<BYTE> path;
+                if (route && route->path.size() > 0) {
+                    path = route->path;
+                    delete route;
+                } else {
+                    path.push_back(0);
+                }
+                SendSessionAck(peer, path);
+                AddLog(L"[SESSION] ESTABLISHED: Re-sent ACK (same keys), skipped rotation", LOG_DEBUG);
+                return true;
+            }
+            // Разные ключи — сервер переинициализировался, принимаем и продолжаем
+            AddLog(L"[SESSION] ESTABLISHED: New keys from server, accepting", LOG_WARN);
+        } else {
+            LeaveCriticalSection(&m_lock);
+            AddLog(L"[SESSION] ESTABLISHED: Ignoring ACK (session active)", LOG_DEBUG);
+            return true;
+        }
+    }
+
     // Если уже готовы и пришел повторный пакет с теми же ключами
     if (m_bReady && memcmp(m_remoteCurrentPub, remoteCurrentPub, 32) == 0) {
         if (sessionType == SESSION_INIT) {
@@ -1006,12 +1099,14 @@ bool IronSession::HandleSessionHandshake(const BYTE* packet, DWORD len, int sess
     
     m_bReady = true;
     m_decryptionErrors = 0;
-    
+    m_lastActivity = GetTickCount();   // Сессия активна после handshake
+    m_lastRotation = GetTickCount();   // Сброс таймера ротации — после handshake ключи уже свежие
+
     // NOTE: TCP state остается CLOSED! ESTABLISHED устанавливается только при получении TCP SYN-ACK
-    
+
     LeaveCriticalSection(&m_lock);
-    
-    wsprintf(debug, L"[SESSION] Ready! Local KeySeq=%llu, Remote KeySeq=%llu, TCP=ESTABLISHED", 
+
+    wsprintf(debug, L"[SESSION] Ready! Local KeySeq=%llu, Remote KeySeq=%llu",
              m_localKeySeq, m_remoteKeySeq);
     AddLog(debug, LOG_SUCCESS);
     
@@ -1029,6 +1124,9 @@ bool IronSession::SendTraffic(IronPeer* peer, const vector<BYTE>& path, const BY
         return false;
     }
     
+    // Обновляем активность при отправке
+    m_lastActivity = GetTickCount();
+
     // Увеличиваем nonce
     m_sendNonce++;
     
@@ -1081,20 +1179,24 @@ bool IronSession::SendTraffic(IronPeer* peer, const vector<BYTE>& path, const BY
     // SESSION_TRAFFIC type
     packet.push_back(SESSION_TRAFFIC);
     
-    // localKeySeq (varint)
-    if (m_localKeySeq < 0x80) {
-        packet.push_back((BYTE)m_localKeySeq);
-    } else {
-        packet.push_back((BYTE)((m_localKeySeq & 0x7F) | 0x80));
-        packet.push_back((BYTE)(m_localKeySeq >> 7));
+    // localKeySeq (varint, полный цикл)
+    {
+        unsigned long long v = m_localKeySeq;
+        while (v >= 0x80) {
+            packet.push_back((BYTE)((v & 0x7F) | 0x80));
+            v >>= 7;
+        }
+        packet.push_back((BYTE)v);
     }
-    
-    // remoteKeySeq (varint)
-    if (m_remoteKeySeq < 0x80) {
-        packet.push_back((BYTE)m_remoteKeySeq);
-    } else {
-        packet.push_back((BYTE)((m_remoteKeySeq & 0x7F) | 0x80));
-        packet.push_back((BYTE)(m_remoteKeySeq >> 7));
+
+    // remoteKeySeq (varint, полный цикл)
+    {
+        unsigned long long v = m_remoteKeySeq;
+        while (v >= 0x80) {
+            packet.push_back((BYTE)((v & 0x7F) | 0x80));
+            v >>= 7;
+        }
+        packet.push_back((BYTE)v);
     }
     
     // sendNonce (varint)
@@ -1151,9 +1253,10 @@ bool IronSession::HandleSessionTraffic(const BYTE* packet, DWORD len, IronPeer* 
         return false;
     }
     
-    // Если TCP сессия уже закрыта или в процессе закрытия - игнорируем пакеты
-    if (m_tcpState == TCP_FIN_WAIT || m_tcpState == TCP_CLOSED) {
-        AddLog(L"[TRAFFIC] TCP session already closed/fin_wait, dropping packet", LOG_DEBUG);
+    // Если TCP сессия закрыта И не в процессе нового подключения — игнорируем
+    // (SYN_SENT допускает приём SYN-ACK даже после предыдущего FIN_WAIT/CLOSED)
+    if (m_tcpState == TCP_CLOSED) {
+        AddLog(L"[TRAFFIC] TCP closed, dropping packet", LOG_DEBUG);
         return false;
     }
     
@@ -1251,9 +1354,22 @@ bool IronSession::HandleSessionTraffic(const BYTE* packet, DWORD len, IronPeer* 
         noncePtr = &m_nextRecvNonce;
         needsRotation = true;
     } else {
-        AddLog(L"[TRAFFIC] Key mismatch - cannot decrypt", LOG_WARN);
+        // KeySeq mismatch — шлём SESSION_INIT для ресинхронизации (как в Go)
+        wsprintf(debug, L"[TRAFFIC] KeySeq mismatch: pkt localSeq=%lu remoteSeq=%lu, our localSeq=%I64u remoteSeq=%I64u",
+                 receivedLocalKeySeq, receivedRemoteKeySeq, m_localKeySeq, m_remoteKeySeq);
+        AddLog(debug, LOG_WARN);
         LeaveCriticalSection(&m_lock);
-        return false;  // Несоответствие ключей
+
+        NodeRoute* route = peer->GetRoute(peer->GetKeyPrefix(m_remoteKey));
+        vector<BYTE> path;
+        if (route && route->path.size() > 0) {
+            path = route->path;
+            delete route;
+        } else {
+            path.push_back(0);
+        }
+        SendSessionInit(peer, path);
+        return false;
     }
     
     // Формируем nonce (24 байта)
@@ -1280,7 +1396,8 @@ bool IronSession::HandleSessionTraffic(const BYTE* packet, DWORD len, IronPeer* 
     
     m_decryptionErrors = 0;
     *noncePtr = nonce;
-    
+    m_lastActivity = GetTickCount();  // Обновляем активность при успешном recv
+
     wsprintf(debug, L"[TRAFFIC] Decrypted OK, plaintext=%lu bytes", plaintext.size());
     AddLog(debug, LOG_SUCCESS);
     
@@ -1296,7 +1413,7 @@ bool IronSession::HandleSessionTraffic(const BYTE* packet, DWORD len, IronPeer* 
     
     // Ротация ключей только по таймеру (не при каждом пакете!)
     // Это предотвращает рассинхронизацию с сервером
-    if (needsRotation && (GetTickCount() - m_lastRotation > KEY_ROTATION_INTERVAL) && false) {
+    if (needsRotation && (GetTickCount() - m_lastRotation > KEY_ROTATION_INTERVAL)) {
         PerformKeyRotation(theirNextPub, nonce);
     }
     
@@ -1356,6 +1473,23 @@ void IronSession::SendSYN(IronPeer* peer, const vector<BYTE>& path) {
     wsprintf(debug, L"[TCP] Sending SYN seq=%lu, path len=%d", seq, path.size());
     AddLog(debug, LOG_INFO);
     
+    CreateAndSendPacket(peer, path, true, false, false, false, seq, 0, empty, 0, dummy);
+}
+
+// Отправка SYN-пакета без проверки состояния — вызывается после TryClaimSynInitiator,
+// который уже атомарно сбросил TCP-состояние и пометил m_synSent=true.
+void IronSession::SendSYNPacket(IronPeer* peer, const vector<BYTE>& path) {
+    DWORD seq;
+    EnterCriticalSection(&m_lock);
+    seq = m_localSeq;
+    m_localSeq = (m_localSeq + 1) & 0xFFFFFFFF;
+    LeaveCriticalSection(&m_lock);
+
+    BYTE empty[1] = {0};
+    DWORD dummy;
+    WCHAR debug[256];
+    wsprintf(debug, L"[TCP] Sending SYN seq=%lu, path len=%d", seq, path.size());
+    AddLog(debug, LOG_INFO);
     CreateAndSendPacket(peer, path, true, false, false, false, seq, 0, empty, 0, dummy);
 }
 
@@ -1528,35 +1662,49 @@ void IronSession::ProcessIncomingTCP(IronPeer* peer, const vector<BYTE>& path,
     
     EnterCriticalSection(&m_lock);
     
-    wsprintf(debug, L"[TCP] State=%d (SYN_SENT=%d, ESTABLISHED=%d)", 
-             m_tcpState, TCP_SYN_SENT, TCP_ESTABLISHED);
+    wsprintf(debug, L"[TCP] State=%d flags=0x%02x syn=%d ack=%d psh=%d fin=%d rst=%d payloadLen=%d seq=%lu ack=%lu",
+             m_tcpState, flags, (int)isSyn, (int)isAck, (int)((flags&0x08)!=0),
+             (int)isFin, (int)isRst, tcpPayloadLen, seqNum, ackNum);
     AddLog(debug, LOG_DEBUG);
     
-    // Обработка SYN-ACK
+    // Обработка SYN-ACK (только в состоянии SYN_SENT)
     if (m_tcpState == TCP_SYN_SENT && isAck) {
-        if (ackNum == m_localSeq) {
-            m_remoteSeq = seqNum;
-            m_nextExpectedSeq = (seqNum + (isSyn ? 1 : 0)) & 0xFFFFFFFF;
-            if (m_nextExpectedSeq == 0) m_nextExpectedSeq = 1;
+        wsprintf(debug, L"[TCP] SYN_SENT got ACK: ackNum=%lu, localSeq=%lu, isSyn=%d, payloadLen=%d",
+                 ackNum, m_localSeq, (int)isSyn, tcpPayloadLen);
+        AddLog(debug, LOG_DEBUG);
 
-            m_remoteAck = ackNum;
-            m_tcpState = TCP_ESTABLISHED;
-            
+        // Проверяем что ackNum соответствует нашему SYN — защита от запоздалых пакетов
+        if (ackNum != m_localSeq) {
+            wsprintf(debug, L"[TCP] SYN_SENT: ackNum=%lu != localSeq=%lu, discarding stale packet", ackNum, m_localSeq);
+            AddLog(debug, LOG_WARN);
             LeaveCriticalSection(&m_lock);
-            SendACK(peer, path, m_nextExpectedSeq);
-            
-            EnterCriticalSection(&m_lock);
-            vector<BYTE> pending = m_pendingData;
-            m_pendingData.clear();
-            LeaveCriticalSection(&m_lock);
-
-            if (pending.size() > 0) {
-                SendData(peer, path, &pending[0], pending.size());
-            }
             return;
         }
+
+        m_remoteSeq = seqNum;
+        m_nextExpectedSeq = (seqNum + (isSyn ? 1 : 0)) & 0xFFFFFFFF;
+        if (m_nextExpectedSeq == 0) m_nextExpectedSeq = 1;
+
+        m_remoteAck = ackNum;
+        m_tcpState = TCP_ESTABLISHED;
+
+        LeaveCriticalSection(&m_lock);
+        SendACK(peer, path, m_nextExpectedSeq);
+
+        EnterCriticalSection(&m_lock);
+        vector<BYTE> pending = m_pendingData;
+        m_pendingData.clear();
+        LeaveCriticalSection(&m_lock);
+
+        if (pending.size() > 0) {
+            SendData(peer, path, &pending[0], pending.size());
+        }
+
+        // Если в этом же пакете есть данные — обрабатываем их ниже
+        if (tcpPayloadLen <= 0) return;
+        EnterCriticalSection(&m_lock);
     }
-    
+
     if (m_tcpState != TCP_ESTABLISHED && m_tcpState != TCP_FIN_WAIT) {
         LeaveCriticalSection(&m_lock);
         return;

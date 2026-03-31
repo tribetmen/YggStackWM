@@ -88,7 +88,9 @@ private:
     // Состояние сессии
     bool m_bReady;
     bool m_bClosed;
+    volatile bool m_inUse;  // Захвачена HTTP-потоком (эксклюзивное использование)
     DWORD m_lastRotation;
+    DWORD m_lastActivity;   // Время последней активности (для timeout)
     int m_decryptionErrors;
     
     // Порты
@@ -118,6 +120,7 @@ private:
     // Буфер реассемблирования
     map<DWORD, vector<BYTE> > m_reassemblyBuffer;
     DWORD m_reassemblyBufferSize;
+    vector<BYTE> m_earlyRecvData;  // Данные полученные до SYN-ACK, буферизуются и отдаются после ESTABLISHED
     DWORD m_oldestBufferedTime;
     int m_dupAckCount;
 
@@ -153,6 +156,7 @@ public:
     
     // TCP обработка
     void SendSYN(IronPeer* peer, const vector<BYTE>& path);
+    void SendSYNPacket(IronPeer* peer, const vector<BYTE>& path);  // Отправка SYN без проверки состояния (после TryClaimSynInitiator)
     void SendACK(IronPeer* peer, const vector<BYTE>& path, DWORD ackNum);
     void SendDupACK(IronPeer* peer, const vector<BYTE>& path, DWORD ackNum);
     void SendFIN(IronPeer* peer, const vector<BYTE>& path);
@@ -183,6 +187,27 @@ public:
     void UpdateActivity() { m_decryptionErrors = 0; }
     void SetRemoteIPv6(const BYTE* ipv6) { memcpy(m_remoteIPv6, ipv6, 16); }
     void ResetTcpState();  // Сброс TCP для повторного использования Ironwood-сессии
+    void TouchActivity() { m_lastActivity = GetTickCount(); }
+    DWORD GetLastActivity() const { return m_lastActivity; }
+    bool IsTimedOut(DWORD timeoutMs) const {
+        return (GetTickCount() - m_lastActivity) > timeoutMs;
+    }
+    // Атомарная попытка захватить право инициировать SYN.
+    // Возвращает true если этот поток стал инициатором (должен послать SYN),
+    // false если другой поток уже начал подключение.
+    bool TryClaimSynInitiator();
+    // Эксклюзивный захват сессии HTTP-потоком. Возвращает true если захвачено.
+    bool TryAcquireUse() {
+        EnterCriticalSection(&m_lock);
+        if (m_inUse) { LeaveCriticalSection(&m_lock); return false; }
+        m_inUse = true;
+        LeaveCriticalSection(&m_lock);
+        return true;
+    }
+    void ReleaseUse() { m_inUse = false; }
+    bool IsInUse() const { return m_inUse; }
+    void Lock()   { EnterCriticalSection(&m_lock); }
+    void Unlock() { LeaveCriticalSection(&m_lock); }
     
     // Callback для получения данных
     void SetDataCallback(DataCallback callback, void* context);
