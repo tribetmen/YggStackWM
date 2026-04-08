@@ -24,6 +24,17 @@ public:
     
     // Получить TCP flags
     static int getTCPFlags(const BYTE* ipv6Packet, DWORD len);
+
+    // Создать IPv6+UDP пакет (Next Header = 17)
+    static vector<BYTE> wrapUDP(const BYTE* srcAddr, const BYTE* dstAddr,
+                                 WORD srcPort, WORD dstPort,
+                                 const BYTE* data, DWORD dataLen);
+
+    // Извлечь UDP payload из IPv6 пакета (Next Header == 17)
+    // Возвращает false если пакет не UDP
+    static bool unwrapUDP(const BYTE* ipv6Packet, DWORD len,
+                          WORD& outSrcPort, WORD& outDstPort,
+                          const BYTE*& outData, DWORD& outDataLen);
     
 private:
     // Создать TCP сегмент

@@ -51,9 +51,13 @@ extern void ShowContextMenu(HWND hWnd, int x, int y);
 extern void ShowKeyboard(BOOL bShow);
 extern void DrawFrameRect(HDC hdc, RECT* rc, COLORREF color);
 extern COLORREF GetLogColor(BYTE type);
+extern void SaveConfig();
 
 // === Локальные переменные ===
 static BOOL s_longPressTimerActive = FALSE;
+static BOOL s_tapCancelled         = FALSE; // TRUE если палец сдвинулся — тап не засчитывается
+static int  s_tapX = 0, s_tapY = 0;        // координаты нажатия для LButtonUp
+#define TAP_SLOP 8                           // пикселей допуска до отмены тапа
 
 // === Инициализация ===
 void InitTouchInput() {
@@ -62,220 +66,255 @@ void InitTouchInput() {
     s_longPressTimerActive = FALSE;
 }
 
-// === Обработка нажатия ===
-void HandleLButtonDown(HWND hWnd, int x, int y) {
+// === Обработка тапа (вызывается из LButtonUp если не было drag) ===
+static void HandleTap(HWND hWnd, int x, int y) {
     RECT rcClient;
     GetClientRect(hWnd, &rcClient);
-    int width = rcClient.right - rcClient.left;
+    int width  = rcClient.right - rcClient.left;
     int height = rcClient.bottom - rcClient.top;
-    
-    g_lastX = x;
-    g_lastY = y;
-    g_longPressDetected = FALSE;
-    
-    // Запускаем таймер долгого нажатия
-    SetTimer(hWnd, ID_TIMER_LONGPRESS, 500, NULL);
-    s_longPressTimerActive = TRUE;
-    
-    // Проверяем нажатие на нижнюю панель (табы)
-    int panelHeight = (height >= 640) ? 55 : ((height >= 480) ? 50 : 45);
-    int bottomY = height - panelHeight;
-    
-    if (y >= bottomY && y <= height) {
-        KillTimer(hWnd, ID_TIMER_LONGPRESS);
-        s_longPressTimerActive = FALSE;
-        
-        int margin = (width >= 640) ? 10 : ((width >= 480) ? 8 : 5);
-        int btnWidth = (width - (margin * 4)) / 3;
-        
-        if (x >= margin && x <= margin + btnWidth) {
-            g_currentTab = 0;
-            InvalidateRect(hWnd, NULL, TRUE);
-        }
-        else if (x >= margin * 2 + btnWidth && x <= margin * 2 + btnWidth * 2) {
-            g_currentTab = 1;
-            if (g_editingKey || g_addingPeer) {
-                ShowKeyboard(FALSE);
-                g_editingKey = FALSE;
-                g_addingPeer = FALSE;
+
+    // Нижняя панель (табы)
+    {
+        int SC2   = (width >= 640) ? 3 : ((width >= 480) ? 5 : 4);
+        int SD2   = (width >= 640) ? 2 : ((width >= 480) ? 4 : 4);
+        int tabH2 = 48 * SC2 / SD2;
+        if (y >= height - tabH2) {
+            int tw    = width / 3;
+            int newTab = (x < tw) ? 0 : (x < tw*2) ? 1 : 2;
+            if (newTab != g_currentTab) {
+                g_currentTab = newTab;
+                if (g_editingKey || g_addingPeer || g_addingDns) {
+                    ShowKeyboard(FALSE);
+                    g_editingKey = FALSE; g_addingPeer = FALSE; g_addingDns = FALSE;
+                }
+                InvalidateRect(hWnd, NULL, TRUE);
             }
-            InvalidateRect(hWnd, NULL, TRUE);
+            return;
         }
-        else if (x >= margin * 3 + btnWidth * 2 && x <= margin * 3 + btnWidth * 3) {
-            g_currentTab = 2;
-            if (g_editingKey || g_addingPeer) {
-                ShowKeyboard(FALSE);
-                g_editingKey = FALSE;
-                g_addingPeer = FALSE;
-            }
-            InvalidateRect(hWnd, NULL, TRUE);
-        }
-        return;
     }
-    
+
     // === Конфиг вкладка ===
     if (g_currentTab == 0) {
-        int margin = (width >= 640) ? 30 : ((width >= 480) ? 20 : 5);
-        int scrollY = g_scroll.y;
-        // Как в YggDraw.cpp DrawConfigTab
-        int sectionHeight = (height >= 640) ? 30 : 25;
-        int keyFieldHeight = (width >= 640) ? 70 : ((width >= 480) ? 65 : 55);
-        int contentY = g_topPanelY + 50;
-        
-        // === Секция ключа ===
-        // Сначала заголовок "Private Key" (sectionHeight)
-        // Потом поле ключа на keyFieldY
-        int keyFieldY = contentY - scrollY + sectionHeight;
-        
-        // Кнопка просмотра ключа (рядом с полем ключа)
-        RECT rcViewBtn = {width - margin - 25, keyFieldY, width - margin, keyFieldY + 25};
-        if (x >= rcViewBtn.left && x <= rcViewBtn.right && 
-            y >= rcViewBtn.top && y <= rcViewBtn.bottom) {
-            g_showFullKey = !g_showFullKey;
-            InvalidateRect(hWnd, NULL, TRUE);
-            return;
-        }
-        
-        // Поле ключа
-        RECT rcKey = {margin, keyFieldY, width - margin - 30, keyFieldY + keyFieldHeight};
-        if (x >= rcKey.left && x <= rcKey.right && 
-            y >= rcKey.top && y <= rcKey.bottom) {
-            if (!g_editingKey) {
-                g_editingKey = TRUE;
-                wcscpy(g_tempKey, g_privateKeyFull);
-                ShowKeyboard(TRUE);
-            } else {
-                g_editingKey = FALSE;
-                g_tempKey[0] = 0;
-                ShowKeyboard(FALSE);
-            }
-            InvalidateRect(hWnd, NULL, TRUE);
-            return;
-        }
-        
-        // === Секция пиров ===
-        // После поля ключа: +10 (или +25 при редактировании)
-        int peersSectionY = keyFieldY + keyFieldHeight + 10;
-        if (g_editingKey) {
-            peersSectionY = keyFieldY + keyFieldHeight + 25;
-        }
-        
-        // Кнопка добавления пира
-        RECT rcAddPeer = {width - margin - 25, peersSectionY, width - margin, peersSectionY + 22};
-        if (x >= rcAddPeer.left && x <= rcAddPeer.right && 
-            y >= rcAddPeer.top && y <= rcAddPeer.bottom) {
-            g_addingPeer = !g_addingPeer;
-            if (g_addingPeer) {
-                // Явная инициализация tcp://
-                g_newPeer[0] = L't';
-                g_newPeer[1] = L'c';
-                g_newPeer[2] = L'p';
-                g_newPeer[3] = L':';
-                g_newPeer[4] = L'/';
-                g_newPeer[5] = L'/';
-                g_newPeer[6] = 0;
-                ShowKeyboard(TRUE);
-            } else {
-                ShowKeyboard(FALSE);
-            }
-            InvalidateRect(hWnd, NULL, TRUE);
-            return;
-        }
-        
-        // Список пиров - удаление (крестик)
-        // После заголовка Peers (sectionHeight) и поля ввода (если есть)
-        int peersListY = peersSectionY + sectionHeight;
-        if (g_addingPeer) {
-            peersListY += 55;
-        }
-        
-        // Как в YggDraw.cpp: peerItemHeight = (height >= 640) ? 26 : 22
-        int itemHeight = (height >= 640) ? 26 : 22;
-        for (int i = 0; i < g_peerCount; i++) {
-            int peerY = peersListY + i * itemHeight;
-            RECT rcDelete = {width - margin - 20, peerY, width - margin - 5, peerY + 18};
-            if (x >= rcDelete.left && x <= rcDelete.right &&
-                y >= rcDelete.top && y <= rcDelete.bottom) {
-                for (int j = i; j < g_peerCount - 1; j++) {
-                    wcscpy(g_peersList[j], g_peersList[j + 1]);
-                }
-                g_peerCount--;
-                g_peersList[g_peerCount][0] = 0;
-                SaveConfig();
+        extern BOOL g_isButtonPhone;
+        extern BOOL g_httpProxyRunning;
+        extern WCHAR g_dnsServers[8][64];
+        extern int g_dnsCount;
+        extern BOOL g_addingDns;
+        extern WCHAR g_newDns[64];
+
+        int SC = (width >= 640) ? 3 : ((width >= 480) ? 5 : 4);
+        int SD = (width >= 640) ? 2 : ((width >= 480) ? 4 : 4);
+        #define SC_T(px) ((px) * SC / SD)
+
+        int tabH  = SC_T(48);
+        int barH  = (width >= 480) ? 44 : 32; // TopBarHeight, синхронно с YggDraw.cpp
+        int topH  = g_topPanelY + barH;
+        int mx    = SC_T(10);
+        int hdrH  = SC_T(20);
+        int itemH = SC_T(38);
+        int rowH  = SC_T(40);
+        int btnH  = SC_T(42);
+        int sY    = g_scroll.y;
+
+        // ── Кнопка Start/Stop (фиксированная, проверяем ПЕРВОЙ) ──
+        {
+            int by = height - tabH - btnH - SC_T(8);
+            if (x >= mx && x <= width - mx && y >= by && y <= by + btnH) {
+                OnStartService();
                 InvalidateRect(hWnd, NULL, TRUE);
                 return;
             }
         }
-        
-        // Кнопка HTTP Proxy (перед IP секцией) - вычисляем позицию как в отрисовке
-        extern int g_peerCount;
-        extern BOOL g_addingPeer;
-        extern BOOL g_isButtonPhone;
-        int peerItemHeight = g_isButtonPhone ? 28 : ((height >= 640) ? 26 : 22);
-        
-        // Точное вычисление позиции как в YggDraw.cpp DrawConfigTab
-        int proxyY = g_isButtonPhone ? (g_topPanelY + 22) : (g_topPanelY + 50);
-        proxyY += sectionHeight;  // Private Key заголовок, потом y += sectionHeight
-        proxyY += keyFieldHeight;  // Поле ключа
-        proxyY += sectionHeight;  // Peers заголовок, потом y += sectionHeight  
-        // После этого кнопка Add (высота 22), затем y += sectionHeight
-        if (g_addingPeer) proxyY += 55;  // Поле ввода
-        proxyY += g_peerCount * peerItemHeight;  // Список пиров
-        proxyY -= g_scroll.y;  // Учитываем прокрутку
-        
-        RECT rcHttpBtn = {margin, proxyY, width - margin, proxyY + 25};
-        extern BOOL g_httpProxyRunning;
-        if (x >= rcHttpBtn.left && x <= rcHttpBtn.right &&
-            y >= rcHttpBtn.top && y <= rcHttpBtn.bottom) {
-            KillTimer(hWnd, ID_TIMER_LONGPRESS);
-            extern void OnToggleHttpProxy();
-            OnToggleHttpProxy();
-            InvalidateRect(hWnd, NULL, TRUE);
-            return;
+
+        // Высота карточки ключа совпадает с Draw: 4*(charSz.cy+2) + Scale(10).
+        // charSz.cy: ~12 на 240px, ~16 на 480px, ~20 на 640px.
+        // На больших экранах запас +6px, на маленьких — без запаса.
+        int keyLineH = (width >= 640) ? 30 : ((width >= 480) ? 26 : 16);
+        int keyCardH = 4 * keyLineH + SC_T(10) + ((width >= 480) ? 14 : 0);
+
+        int cy = topH + SC_T(8);
+
+        // ── Private Key ──
+        cy += hdrH;
+        {
+            int ctop  = cy - sY;
+            int cbottom = ctop + keyCardH;
+            // Вся карточка — тап переключает редактирование
+            if (x >= mx && x <= width - mx && y >= ctop && y <= cbottom) {
+                if (!g_editingKey) {
+                    g_editingKey = TRUE;
+                    g_showFullKey = FALSE;
+                    wcscpy(g_tempKey, g_privateKeyFull);
+                    ShowKeyboard(TRUE);
+                } else {
+                    g_editingKey = FALSE; g_tempKey[0] = 0;
+                    ShowKeyboard(FALSE);
+                }
+                InvalidateRect(hWnd, NULL, TRUE);
+                return;
+            }
+            cy += keyCardH + SC_T(12);
         }
-        
-        // Кнопка Start/Stop
-        int btnY = height - 80;
-        if (y >= btnY && y <= btnY + 35 && x >= 20 && x <= width - 20) {
-            KillTimer(hWnd, ID_TIMER_LONGPRESS);
-            OnStartService();
-            InvalidateRect(hWnd, NULL, TRUE);
-            return;
+
+        // ── Peers ──
+        cy += hdrH;
+        {
+            int icy = cy;
+            for (int i = 0; i < g_peerCount; i++) {
+                int rtop = icy - sY;
+                int delW = SC_T(32);
+                int delL = width - mx - delW - 4, delR = width - mx - 4;
+                int delTop = rtop + (itemH - SC_T(24))/2;
+                int delBot = rtop + (itemH + SC_T(24))/2;
+                if (x >= delL && x <= delR && y >= delTop && y <= delBot) {
+                    for (int j = i; j < g_peerCount - 1; j++)
+                        wcscpy(g_peersList[j], g_peersList[j+1]);
+                    g_peerCount--;
+                    g_peersList[g_peerCount][0] = 0;
+                    SaveConfig();
+                    InvalidateRect(hWnd, NULL, TRUE);
+                    return;
+                }
+                icy += itemH;
+            }
+            if (g_addingPeer) icy += itemH;
+            {   // Строка «+ Add peer»
+                int rtop = icy - sY;
+                if (x >= mx && x <= width - mx && y >= rtop && y <= rtop + itemH) {
+                    g_addingPeer = !g_addingPeer;
+                    if (g_addingPeer) {
+                        g_newPeer[0]=L't'; g_newPeer[1]=L'c'; g_newPeer[2]=L'p';
+                        g_newPeer[3]=L':'; g_newPeer[4]=L'/'; g_newPeer[5]=L'/';
+                        g_newPeer[6]=0;
+                        ShowKeyboard(TRUE);
+                    } else {
+                        g_newPeer[0] = 0;
+                        ShowKeyboard(FALSE);
+                    }
+                    InvalidateRect(hWnd, NULL, TRUE);
+                    return;
+                }
+            }
+            int linesCount = g_peerCount + (g_addingPeer ? 1 : 0) + 1;
+            cy += linesCount * itemH + SC_T(12);
         }
+
+        // ── Your Yggdrasil IP ── (не кликабельно)
+        // Высота считается как в Draw: построчный перенос адаптивно по ширине
+        cy += hdrH;
+        {
+            extern WCHAR g_currentIP[50];
+            int ipLineH  = (width >= 640) ? 24 : ((width >= 480) ? 20 : 17);
+            int ipPad    = SC_T(8);
+            int charW    = (width >= 640) ? 9 : ((width >= 480) ? 8 : 7); // приближение ширины символа
+            int textW    = (width - 2 * mx) - 2 * ipPad;
+            int charsPerLine = (charW > 0) ? (textW / charW) : 20;
+            if (charsPerLine < 4) charsPerLine = 4;
+            int ipLen    = (int)wcslen(g_currentIP);
+            int ipLines  = (ipLen > 0) ? ((ipLen + charsPerLine - 1) / charsPerLine) : 1;
+            int ipCardH  = ipLines * ipLineH + 2 * ipPad;
+            int minH     = SC_T(40);
+            if (ipCardH < minH) ipCardH = minH;
+            cy += ipCardH + SC_T(12);
+        }
+
+        // ── Proxy Configuration ──
+        cy += hdrH;
+        {
+            int ctop = cy - sY;
+            if (x >= mx && x <= width - mx && y >= ctop && y <= ctop + rowH) {
+                extern void OnToggleHttpProxy();
+                OnToggleHttpProxy();
+                InvalidateRect(hWnd, NULL, TRUE);
+                return;
+            }
+            cy += rowH + SC_T(12);
+        }
+
+        // ── DNS Servers ──
+        cy += hdrH;
+        {
+            int icy = cy;
+            for (int i = 0; i < g_dnsCount; i++) {
+                int rtop = icy - sY;
+                int delW = SC_T(32);
+                int delL = width - mx - delW - 4, delR = width - mx - 4;
+                int delTop = rtop + (itemH - SC_T(24))/2;
+                int delBot = rtop + (itemH + SC_T(24))/2;
+                if (x >= delL && x <= delR && y >= delTop && y <= delBot) {
+                    if (g_dnsCount > 1) {
+                        for (int j = i; j < g_dnsCount - 1; j++)
+                            wcscpy(g_dnsServers[j], g_dnsServers[j+1]);
+                        g_dnsCount--;
+                        g_dnsServers[g_dnsCount][0] = L'\0';
+                        SaveConfig();
+                    }
+                    InvalidateRect(hWnd, NULL, TRUE);
+                    return;
+                }
+                icy += itemH;
+            }
+            if (g_addingDns) icy += itemH;
+            {   // Строка «+ Add DNS»
+                int rtop = icy - sY;
+                if (x >= mx && x <= width - mx && y >= rtop && y <= rtop + itemH) {
+                    g_addingDns = !g_addingDns;
+                    if (g_addingDns) { g_newDns[0] = L'\0'; ShowKeyboard(TRUE); }
+                    else             { ShowKeyboard(FALSE); }
+                    InvalidateRect(hWnd, NULL, TRUE);
+                    return;
+                }
+            }
+        }
+
+        #undef SC_T
     }
-    
+
     // === Логи вкладка ===
     if (g_currentTab == 1) {
-        int margin = (width >= 640) ? 15 : ((width >= 480) ? 12 : 8);
-        int panelY = g_topPanelY + 45;
-        
-        // Кнопка On/Off
-        RECT rcToggle = {width - margin - 120, panelY, width - margin - 65, panelY + 25};
-        if (x >= rcToggle.left && x <= rcToggle.right &&
-            y >= rcToggle.top && y <= rcToggle.bottom) {
+        int SC = (width >= 640) ? 3 : ((width >= 480) ? 5 : 4);
+        int SD = (width >= 640) ? 2 : ((width >= 480) ? 4 : 4);
+        #define SC_L(px) ((px) * SC / SD)
+
+        int topH = g_topPanelY + ((width >= 480) ? 44 : 32);
+        int mx   = SC_L(8);
+        int btnH = SC_L(28);
+        int panY = topH + SC_L(6);
+
+        RECT rcOn = { width - mx - SC_L(120), panY, width - mx - SC_L(62), panY + btnH };
+        if (x >= rcOn.left && x <= rcOn.right && y >= rcOn.top && y <= rcOn.bottom) {
             ToggleLogs();
             InvalidateRect(hWnd, NULL, TRUE);
             return;
         }
-        
-        // Кнопка Clear
-        RECT rcClear = {width - margin - 60, panelY, width - margin, panelY + 25};
-        if (x >= rcClear.left && x <= rcClear.right &&
-            y >= rcClear.top && y <= rcClear.bottom) {
-            // Очистка лога
+
+        RECT rcCl = { width - mx - SC_L(56), panY, width - mx, panY + btnH };
+        if (x >= rcCl.left && x <= rcCl.right && y >= rcCl.top && y <= rcCl.bottom) {
             extern int g_logHead, g_logTail, g_logCount;
             extern LogEntry g_logBuffer[];
-            g_logHead = 0;
-            g_logTail = 0;
-            g_logCount = 0;
+            g_logHead = 0; g_logTail = 0; g_logCount = 0;
             memset(g_logBuffer, 0, sizeof(LogEntry) * 200);
-            if (g_logsEnabled) AddLog(L"Log cleared", 0); // LOG_INFO = 0
+            if (g_logsEnabled) AddLog(L"Log cleared", 0);
             InvalidateRect(hWnd, NULL, TRUE);
             return;
         }
+
+        #undef SC_L
     }
-    
-    // Начинаем перетаскивание
+}
+
+// === Обработка нажатия (только запоминаем координаты и начинаем скролл) ===
+void HandleLButtonDown(HWND hWnd, int x, int y) {
+    g_lastX = x;
+    g_lastY = y;
+    s_tapX  = x;
+    s_tapY  = y;
+    s_tapCancelled      = FALSE;
+    g_longPressDetected = FALSE;
+
+    SetTimer(hWnd, ID_TIMER_LONGPRESS, 500, NULL);
+    s_longPressTimerActive = TRUE;
+
     g_dragging = TRUE;
     Scroll_OnDragStart(&g_scroll, x, y);
     SetCapture(hWnd);
@@ -287,20 +326,31 @@ void HandleLButtonUp(HWND hWnd) {
         KillTimer(hWnd, ID_TIMER_LONGPRESS);
         s_longPressTimerActive = FALSE;
     }
-    
-    if (g_longPressDetected) {
-        g_longPressDetected = FALSE;
-    } else {
-        g_dragging = FALSE;
-        Scroll_OnDragEnd(&g_scroll);
-        ReleaseCapture();
-        InvalidateRect(hWnd, NULL, FALSE);
+
+    g_dragging = FALSE;
+    Scroll_OnDragEnd(&g_scroll);
+    ReleaseCapture();
+    InvalidateRect(hWnd, NULL, FALSE);
+
+    if (!g_longPressDetected && !s_tapCancelled) {
+        HandleTap(hWnd, s_tapX, s_tapY);
     }
+    g_longPressDetected = FALSE;
 }
 
 // === Обработка движения ===
 void HandleMouseMove(HWND hWnd, int x, int y) {
     if (g_dragging) {
+        int dx = x - s_tapX;
+        int dy = y - s_tapY;
+        // Если сдвинулись больше допуска — отменяем тап
+        if (!s_tapCancelled && (dx*dx + dy*dy) > TAP_SLOP*TAP_SLOP) {
+            s_tapCancelled = TRUE;
+            if (s_longPressTimerActive) {
+                KillTimer(hWnd, ID_TIMER_LONGPRESS);
+                s_longPressTimerActive = FALSE;
+            }
+        }
         int oldY = g_scroll.y;
         Scroll_OnDragMove(&g_scroll, x, y);
         if (oldY != g_scroll.y) {
@@ -334,6 +384,9 @@ BOOL HandleTouchMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 } else if (g_addingPeer) {
                     int len = wcslen(g_newPeer);
                     if (len > 0) g_newPeer[len - 1] = 0;
+                } else if (g_addingDns) {
+                    int len = wcslen(g_newDns);
+                    if (len > 0) g_newDns[len - 1] = 0;
                 }
                 InvalidateRect(hWnd, NULL, FALSE);
                 return TRUE;
@@ -352,6 +405,14 @@ BOOL HandleTouchMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         g_peerCount++;
                         SaveConfig();
                     }
+                } else if (g_addingDns) {
+                    g_addingDns = FALSE;
+                    ShowKeyboard(FALSE);
+                    if (wcslen(g_newDns) > 0 && g_dnsCount < 8) {
+                        wcscpy(g_dnsServers[g_dnsCount], g_newDns);
+                        g_dnsCount++;
+                        SaveConfig();
+                    }
                 }
                 InvalidateRect(hWnd, NULL, FALSE);
                 return TRUE;
@@ -368,6 +429,12 @@ BOOL HandleTouchMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (len < 127) {
                         g_newPeer[len] = ch;
                         g_newPeer[len + 1] = 0;
+                    }
+                } else if (g_addingDns) {
+                    int len = wcslen(g_newDns);
+                    if (len < 63) {
+                        g_newDns[len] = ch;
+                        g_newDns[len + 1] = 0;
                     }
                 }
                 InvalidateRect(hWnd, NULL, FALSE);

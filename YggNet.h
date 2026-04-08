@@ -12,8 +12,9 @@ BOOL InitWinsock();
 // Функция генерации/загрузки ключей
 void LoadOrGenerateKeys();
 
-// Сохранение конфигурации
+// Сохранение и загрузка конфигурации
 void SaveConfig(void);
+void LoadConfig(void);
 
 // HTTP прокси
 void OnToggleHttpProxy();

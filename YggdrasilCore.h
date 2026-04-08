@@ -13,6 +13,7 @@
 class CYggdrasilCore {
 private:
     YggKeys m_keys;
+    BYTE m_xPrivKey[32];  // X25519 private key, вычислен один раз из Ed25519 private key
     vector<IronPeer*> m_peers;
     CRITICAL_SECTION m_peersLock;
     
@@ -64,8 +65,13 @@ public:
     // Принудительное пересоздание Ironwood-сессии (когда старая в FIN_WAIT)
     bool ForceRecreateSessionToIPv6(LPCWSTR ipv6Address, int port);
     
+    // Разбор IPv6-строки в 16 байт (публичная обёртка над статическим ParseIPv6String)
+    static bool ParseIPv6(LPCWSTR ipv6Str, BYTE* outBytes);
+
     // Геттеры
     const YggKeys& GetKeys() const { return m_keys; }
     const BYTE* GetIPv6() const { return m_keys.ipv6; }
+    // Возвращает X25519 private key (вычислен один раз при LoadOrGenerateKeys)
+    const BYTE* GetXPrivKey() const { return m_xPrivKey; }
     WCHAR* GetIPv6String(WCHAR* buffer, int maxLen);
 };

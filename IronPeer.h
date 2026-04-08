@@ -95,10 +95,10 @@ private:
     // Статические процедуры потоков
     static DWORD WINAPI ReceiveThreadProc(LPVOID lpParam);
     static DWORD WINAPI KeepaliveThreadProc(LPVOID lpParam);
-    static DWORD WINAPI SessionInitThreadProc(LPVOID lpParam);  // Асинхронная отправка SESSION_INIT
 
     // Приватные методы
 public:
+    static DWORD WINAPI SessionInitThreadProc(LPVOID lpParam);  // Асинхронная отправка SESSION_INIT
     bool SendPacketRaw(const BYTE* data, DWORD len);
     string GetKeyPrefix(const BYTE* key);
 private:

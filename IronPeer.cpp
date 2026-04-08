@@ -54,18 +54,15 @@ static DWORD WINAPI DelayedAnnounceThreadProc(LPVOID lpParam) {
 
 static DWORD WINAPI DelayedBloomThreadProc(LPVOID lpParam) {
     DelayedBloomArgs* args = (DelayedBloomArgs*)lpParam;
-    
-    AddLog(L"[BLOOM] Waiting 500ms before sending real Bloom filter...", LOG_INFO);
-    Sleep(500);
-    
+
     // Отправляем только если хендшейк пройден
     if (args->peer && args->peer->IsHandshakeComplete()) {
         args->peer->SendBloom(args->pubKey);
-        AddLog(L"[BLOOM] Real Bloom filter sent! Ready for traffic.", LOG_SUCCESS);
+        AddLog(L"[BLOOM] Bloom filter sent.", LOG_SUCCESS);
     } else {
         AddLog(L"[BLOOM] Skipped - handshake not complete", LOG_WARN);
     }
-    
+
     delete args;
     return 0;
 }
@@ -80,6 +77,17 @@ IronPeer::IronPeer(SOCKET sock, const BYTE* remoteKey) {
     // Отключаем Nagle algorithm для минимальной задержки
     int flag = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
+
+    // Большие буферы для транспортного TCP — WinCE может игнорировать, логируем реальное значение
+    int bufSize = 256 * 1024;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char*)&bufSize, sizeof(bufSize));
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&bufSize, sizeof(bufSize));
+    {
+        int actual = 0; int optlen = sizeof(actual);
+        getsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char*)&actual, &optlen);
+        WCHAR dbg[64]; wsprintf(dbg, L"[Peer] SO_RCVBUF actual=%d KB", actual / 1024);
+        AddLog(dbg, LOG_INFO);
+    }
     
     memcpy(m_remoteKey, remoteKey, KEY_SIZE);
     memcpy(m_remoteXPub, remoteKey, KEY_SIZE);
@@ -125,7 +133,7 @@ IronPeer::~IronPeer() {
 // ============================================================================
 
 bool IronPeer::Start() {
-    m_hReceiveThread = CreateThread(NULL, 65536, ReceiveThreadProc, this, 0, NULL);
+    m_hReceiveThread = CreateThread(NULL, 128 * 1024, ReceiveThreadProc, this, 0, NULL);
     if (m_hReceiveThread) {
         // Нормальный приоритет для receive
         SetThreadPriority(m_hReceiveThread, THREAD_PRIORITY_NORMAL);
@@ -133,8 +141,9 @@ bool IronPeer::Start() {
     
     m_hKeepaliveThread = CreateThread(NULL, 65536, KeepaliveThreadProc, this, 0, NULL);
     if (m_hKeepaliveThread) {
-        // Высокий приоритет для keepalive, чтобы не терять соединение
-        SetThreadPriority(m_hKeepaliveThread, THREAD_PRIORITY_HIGHEST);
+        // NORMAL приоритет — keepalive просто пингует раз в 1.5 сек,
+        // HIGHEST мешал бы receive/send потокам на однопроцессорном ARM
+        SetThreadPriority(m_hKeepaliveThread, THREAD_PRIORITY_NORMAL);
     }
     
     return (m_hReceiveThread != NULL && m_hKeepaliveThread != NULL);
@@ -177,50 +186,45 @@ bool IronPeer::SendPacketRaw(const BYTE* data, DWORD len) {
         AddLog(L"[SendPacketRaw] Not connected!", LOG_ERROR);
         return false;
     }
-    
-    WCHAR debug[256];
-    wsprintf(debug, L"[SendPacketRaw] Sending %lu bytes to socket %d", len, m_socket);
-    AddLog(debug, LOG_DEBUG);
-    
+
     int sent = send(m_socket, (char*)data, len, 0);
     if (sent != (int)len) {
-        wsprintf(debug, L"[SendPacketRaw] Send failed: sent=%d, expected=%lu, error=%d", 
+        WCHAR debug[256];
+        wsprintf(debug, L"[SendPacketRaw] Send failed: sent=%d, expected=%lu, error=%d",
                  sent, len, WSAGetLastError());
         AddLog(debug, LOG_ERROR);
         return false;
     }
-    
-    wsprintf(debug, L"[SendPacketRaw] Sent %d bytes OK", sent);
-    AddLog(debug, LOG_DEBUG);
     return true;
 }
 
 bool IronPeer::SendPacket(BYTE type, const BYTE* data, DWORD dataLen) {
     if (!m_bConnected) return false;
-    
-    vector<BYTE> packet;
-    packet.push_back(type);
-    if (data && dataLen > 0) {
-        packet.insert(packet.end(), data, data + dataLen);
-    }
-    
-    // Формируем varint длину
-    BYTE lenBuf[10];
+
+    // Собираем пакет в единый буфер с резервом под varint-длину в начале:
+    // [lenBuf(<=3)][type(1)][data(dataLen)]
+    // Максимум dataLen для контрольных пакетов небольшой (~256 байт)
+    BYTE buf[4 + 1 + 512];
+    if (dataLen > 512) return false;  // защита
+
+    // Формируем varint для (1 + dataLen)
+    BYTE lenBuf[4];
     int lenPos = 0;
-    unsigned long long len = packet.size();
-    
-    while (len >= 0x80) {
-        lenBuf[lenPos++] = (BYTE)((len & 0x7F) | 0x80);
-        len >>= 7;
+    unsigned long long payloadSize = 1 + dataLen;
+    while (payloadSize >= 0x80) {
+        lenBuf[lenPos++] = (BYTE)((payloadSize & 0x7F) | 0x80);
+        payloadSize >>= 7;
     }
-    lenBuf[lenPos++] = (BYTE)len;
-    
-    // Вставляем длину В НАЧАЛО
-    packet.insert(packet.begin(), lenBuf, lenBuf + lenPos);
-    
-    // Отправляем одним пакетом
-    if (send(m_socket, (char*)&packet[0], packet.size(), 0) == SOCKET_ERROR) return false;
-    
+    lenBuf[lenPos++] = (BYTE)payloadSize;
+
+    // Копируем всё в один буфер
+    memcpy(buf, lenBuf, lenPos);
+    buf[lenPos] = type;
+    if (data && dataLen > 0)
+        memcpy(buf + lenPos + 1, data, dataLen);
+    DWORD totalLen = lenPos + 1 + dataLen;
+
+    if (send(m_socket, (char*)buf, totalLen, 0) == SOCKET_ERROR) return false;
     return true;
 }
 
@@ -414,118 +418,76 @@ bool IronPeer::SendHandshakeBundle(const BYTE* ourPubKey, const BYTE* ourPrivKey
 
 bool IronPeer::ReceivePacket(BYTE* buffer, DWORD bufferSize, DWORD& bytesReceived) {
     if (!m_bConnected || m_socket == INVALID_SOCKET) return false;
-    
-    WCHAR debug[256];
-    
+
     // Читаем varint длину пакета
     DWORD packetLen = 0;
     int shift = 0;
     BYTE b;
-    int headerBytes = 0;
-    
-    AddLog(L"[RECV] Reading varint length...", LOG_DEBUG);
-    
+
     do {
         int r = recv(m_socket, (char*)&b, 1, 0);
         if (r != 1) {
+            WCHAR debug[64];
             wsprintf(debug, L"[RECV] Failed to read length byte: %d", WSAGetLastError());
             AddLog(debug, LOG_ERROR);
             return false;
         }
-        headerBytes++;
-        
         packetLen |= (DWORD)(b & 0x7F) << shift;
         shift += 7;
-
-        if (headerBytes > 1 || (b & 0x80)) {
-            wsprintf(debug, L"[RECV] Byte %d: 0x%02x, packetLen now: %lu",
-                     headerBytes, b, packetLen);
-            AddLog(debug, LOG_DEBUG);
-        }
-        
         if (shift > 28) {
             AddLog(L"[RECV] Varint overflow!", LOG_ERROR);
             return false;
         }
     } while (b & 0x80);
-    
-    wsprintf(debug, L"[RECV] Packet length: %lu bytes", packetLen);
-    AddLog(debug, LOG_INFO);
-    
+
     if (packetLen == 0 || packetLen > bufferSize) {
+        WCHAR debug[64];
         wsprintf(debug, L"[RECV] Invalid length: %lu", packetLen);
         AddLog(debug, LOG_ERROR);
         return false;
     }
-    
+
     // Читаем данные пакета
     DWORD totalRead = 0;
     while (totalRead < packetLen) {
         int r = recv(m_socket, (char*)buffer + totalRead, packetLen - totalRead, 0);
         if (r <= 0) {
+            WCHAR debug[64];
             wsprintf(debug, L"[RECV] Read failed: %d", WSAGetLastError());
             AddLog(debug, LOG_ERROR);
             return false;
         }
         totalRead += r;
     }
-    
-    wsprintf(debug, L"[RECV] Read %lu bytes", totalRead);
-    AddLog(debug, LOG_SUCCESS);
-    
+
     bytesReceived = totalRead;
     return true;
 }
 
 void IronPeer::HandleReceivedData(const BYTE* data, DWORD len) {
-    WCHAR debug[256];
-    
-    AddLog(L"=== HANDLE PACKET ===", LOG_INFO);
-    wsprintf(debug, L"Packet size: %lu bytes", len);
-    AddLog(debug, LOG_INFO);
-    
     if (len < 1) {
         AddLog(L"Packet too short", LOG_ERROR);
         return;
     }
-    
+
     BYTE packetType = data[0];
-    
-    LPCWSTR typeName = L"UNKNOWN";
-    switch(packetType) {
-        case 0x01: typeName = L"KEEP_ALIVE"; break;
-        case 0x02: typeName = L"SIG_REQ"; break;
-        case 0x03: typeName = L"SIG_RES"; break;
-        case 0x04: typeName = L"ANNOUNCE"; break;
-        case 0x05: typeName = L"BLOOM"; break;
-        case 0x06: typeName = L"PATH_LOOKUP"; break;
-        case 0x07: typeName = L"PATH_NOTIFY"; break;
-        case 0x09: typeName = L"TRAFFIC"; break;
-    }
-    
-    wsprintf(debug, L"Packet type: 0x%02x (%s)", packetType, typeName);
-    AddLog(debug, LOG_INFO);
-    
+
     switch (packetType) {
         case WIRE_KEEP_ALIVE:
-            AddLog(L"KEEP_ALIVE received", LOG_DEBUG);
             break;
-            
+
         case WIRE_SIG_REQ:
-            AddLog(L"Delegating to HandleSigReq...", LOG_SUCCESS);
             HandleSigReq(data, len);
             break;
-            
+
         case WIRE_SIG_RES:
-            AddLog(L"Delegating to HandleSigRes...", LOG_SUCCESS);
             HandleSigRes(data, len);
             break;
-            
+
         case WIRE_ANNOUNCE:
-            AddLog(L"Delegating to HandleAnnounce...", LOG_INFO);
             HandleAnnounce(data, len);
             break;
-            
+
         case WIRE_BLOOM:
             AddLog(L"BLOOM filter received", LOG_INFO);
             break;
@@ -542,13 +504,13 @@ void IronPeer::HandleReceivedData(const BYTE* data, DWORD len) {
             HandleTraffic(data, len);
             break;
             
-        default:
+        default: {
+            WCHAR debug[64];
             wsprintf(debug, L"Unknown packet type: 0x%02x", packetType);
             AddLog(debug, LOG_WARN);
             break;
+        }
     }
-    
-    AddLog(L"=== PACKET PROCESSED ===", LOG_INFO);
 }
 
 // ============================================================================
@@ -558,9 +520,8 @@ void IronPeer::HandleReceivedData(const BYTE* data, DWORD len) {
 void IronPeer::HandleSigReq(const BYTE* packet, DWORD len) {
     if (!m_bConnected || len < 3) return;
     if (!m_ourEdPub) return; // Ключи не установлены
-    
+
     WCHAR debug[256];
-    AddLog(L"[SIG_REQ] Received", LOG_DEBUG);
     
     const BYTE* p = packet + 1;
     DWORD remaining = len - 1;
@@ -600,9 +561,8 @@ void IronPeer::HandleSigReq(const BYTE* packet, DWORD len) {
 
 void IronPeer::HandleSigRes(const BYTE* packet, DWORD len) {
     if (!m_bConnected || len < 10) return;
-    
+
     WCHAR debug[256];
-    AddLog(L"[SIG_RES] Received", LOG_DEBUG);
     
     const BYTE* p = packet + 1; 
     DWORD remaining = len - 1;
@@ -679,23 +639,9 @@ void IronPeer::HandleSigRes(const BYTE* packet, DWORD len) {
     AddLog(debug, LOG_SUCCESS);
     AddLog(L"[Peer] Handshake complete - peer is now ACTIVE", LOG_SUCCESS);
 
-    // ANNOUNCE и BLOOM — только если нет активных ESTABLISHED сессий.
-    // При keepalive SIG_RES во время активной передачи данных BLOOM не отправляем
-    // чтобы не сбивать маршрутизацию у удалённых узлов.
-    bool hasEstablished = false;
-    EnterCriticalSection(&m_sessionsLock);
-    for (size_t i = 0; i < m_sessions.size(); i++) {
-        if (m_sessions[i]->GetTcpState() == TCP_ESTABLISHED) {
-            hasEstablished = true;
-            break;
-        }
-    }
-    LeaveCriticalSection(&m_sessionsLock);
-
-    if (hasEstablished) {
-        AddLog(L"[SIG_RES] Active sessions exist - skipping ANNOUNCE/BLOOM to avoid disruption", LOG_DEBUG);
-        return;
-    }
+    // SIG_RES — это периодический peer-level handshake (keepalive), не реальный реконнект.
+    // Ironwood-сессии и TCP-туннели поверх них остаются валидными.
+    // Ничего не сбрасываем — ANNOUNCE/BLOOM обновят маршруты без разрыва соединений.
 
     // ANNOUNCE, затем BLOOM (с задержкой 500ms чтобы ANNOUNCE дошёл первым)
     DelayedAnnounceArgs* announceArgs = new DelayedAnnounceArgs();
@@ -726,9 +672,8 @@ void IronPeer::HandleSigRes(const BYTE* packet, DWORD len) {
 
 void IronPeer::HandleAnnounce(const BYTE* packet, DWORD len) {
     if (!m_bConnected || len < 128) return;
-    
+
     WCHAR debug[256];
-    AddLog(L"[ANNOUNCE] Received", LOG_DEBUG);
     
     const BYTE* p = packet + 1;
     DWORD remaining = len - 1;
@@ -1210,6 +1155,39 @@ void IronPeer::HandlePathLookup(const BYTE* packet, DWORD len) {
             SendPathLookup(remoteNodeKey);
         }
     }
+
+    // Сервер прислал PATH_LOOKUP — он знает наш ключ (из Bloom) но не может расшифровать
+    // наш трафик (ротация ключей). Мы ответили PATH_NOTIFY с нашими координатами.
+    // Теперь отправляем SESSION_INIT чтобы сервер узнал наши актуальные session-ключи.
+    // Ищем существующую сессию к remoteNodeKey по первым 14 байтам.
+    {
+        IronSession* existingSession = NULL;
+        EnterCriticalSection(&m_sessionsLock);
+        for (size_t si = 0; si < m_sessions.size(); si++) {
+            if (memcmp(m_sessions[si]->GetRemoteKey(), remoteNodeKey, 14) == 0 &&
+                !m_sessions[si]->IsClosed()) {
+                existingSession = m_sessions[si];
+                existingSession->AddRef();
+                break;
+            }
+        }
+        LeaveCriticalSection(&m_sessionsLock);
+
+        if (existingSession) {
+            // Дебаунс: SESSION_INIT при PATH_LOOKUP не чаще раза в 5 сек
+            // (пир может слать PATH_LOOKUP очень часто — каждый раз блокировал recv-поток на ~60ms)
+            DWORD now = GetTickCount();
+            DWORD lastInit = existingSession->GetLastInitSent();
+            bool shouldSend = existingSession->IsReady() &&
+                              (lastInit == 0 || (now - lastInit) > 5000);
+            if (shouldSend) {
+                AddLog(L"[PATH_LOOKUP] Queuing SESSION_INIT resync (async)", LOG_DEBUG);
+                existingSession->TouchLastInitSent();  // дебаунс: обновляем до запуска потока
+                existingSession->SendSessionInitAsync(this, backPath);
+            }
+            existingSession->Release();
+        }
+    }
 }
 
 // ============================================================================
@@ -1324,27 +1302,41 @@ void IronPeer::HandlePathNotify(const BYTE* packet, DWORD len) {
     // IPv6 содержит только 113 бит ключа
     // Используем полный ключ из PATH_NOTIFY для создания сессии
     CheckPendingSessionsWithFullKey(targetFullKey, serverCoords);
+
+    // Если сессия к этому узлу уже есть (не pending) — значит PATH_NOTIFY пришёл
+    // в ответ на наш PATH_LOOKUP после KeySeq mismatch. Сервер ждёт наш SESSION_INIT
+    // по актуальному пути. Отправляем его.
+    // Ищем по первым 14 байтам — сессия могла быть создана с неполным ключом из IPv6.
+    IronSession* existingSession = NULL;
+    EnterCriticalSection(&m_sessionsLock);
+    for (size_t si = 0; si < m_sessions.size(); si++) {
+        if (memcmp(m_sessions[si]->GetRemoteKey(), targetFullKey, 14) == 0 &&
+            !m_sessions[si]->IsClosed()) {
+            existingSession = m_sessions[si];
+            existingSession->AddRef();
+            break;
+        }
+    }
+    LeaveCriticalSection(&m_sessionsLock);
+
+    if (existingSession) {
+        // Отправляем SESSION_INIT только если сессия уже была готова (случай KeySeq mismatch).
+        // Если сессия только что создана через CheckPendingSessionsWithFullKey выше —
+        // она ещё не готова (IsReady()==false) и сама отправит SESSION_INIT.
+        if (existingSession->IsReady()) {
+            AddLog(L"[PATH_NOTIFY] Existing ready session — sending SESSION_INIT with fresh path", LOG_INFO);
+            existingSession->SendSessionInit(this, serverCoords);
+        } else {
+            AddLog(L"[PATH_NOTIFY] Session not yet ready — skipping SESSION_INIT (handled by pending)", LOG_DEBUG);
+        }
+        existingSession->Release();
+    }
 }
 
 void IronPeer::HandleTraffic(const BYTE* packet, DWORD len) {
     if (!m_bConnected) return;
-    
-    WCHAR debug[256];
-    wsprintf(debug, L"[TRAFFIC] Received %lu bytes", len);
-    AddLog(debug, LOG_DEBUG);
-    
-    // Дамп первых 32 байт
-    wsprintf(debug, L"[TRAFFIC] Dump: ");
-    for (int i = 0; i < 32 && i < (int)len; i++) {
-        wsprintf(debug + wcslen(debug), L"%02x", packet[i]);
-    }
-    AddLog(debug, LOG_DEBUG);
-    
-    if (len < 64) {
-        wsprintf(debug, L"[TRAFFIC] Packet too short: %lu bytes", len);
-        AddLog(debug, LOG_WARN);
-        return;
-    }
+
+    if (len < 64) return;
     
     // Парсим WIRE_TRAFFIC пакет
     // [path (varints 0-terminated)]
@@ -1409,19 +1401,8 @@ void IronPeer::HandleTraffic(const BYTE* packet, DWORD len) {
     remaining -= 32;
     
     // Проверяем, что пакет для нас
-    if (m_ourEdPub && memcmp(dstKey, m_ourEdPub, 32) != 0) {
-        // Debug: показываем ключи
-        string dstHex = GetKeyPrefix(dstKey);
-        string ourHex = GetKeyPrefix(m_ourEdPub);
-        wsprintf(debug, L"[TRAFFIC] Not for us - dst: %S, our: %S", 
-                 dstHex.c_str(), ourHex.c_str());
-        AddLog(debug, LOG_DEBUG);
-        return;
-    }
-    
-    wsprintf(debug, L"[TRAFFIC] For us! pos=%lu, remaining=%lu", pos, remaining);
-    AddLog(debug, LOG_DEBUG);
-    
+    if (m_ourEdPub && memcmp(dstKey, m_ourEdPub, 32) != 0) return;
+
     // Пропускаем один varint (как в Java: CryptoUtils.readUvarint(dis))
     if (remaining < 1) return;
     while (remaining > 0) {
@@ -1429,20 +1410,14 @@ void IronPeer::HandleTraffic(const BYTE* packet, DWORD len) {
         remaining--;
         if (!(b & 0x80)) break;
     }
-    
-    // Session packet - всё оставшееся (как в Java: dis.readAllBytes())
+
+    // Session packet - всё оставшееся
     const BYTE* sessionPacket = packet + pos;
     DWORD sessionLen = remaining;
-    
+
     // Определяем тип сессии
     int sessionType = sessionPacket[0] & 0xFF;
-    
-    wsprintf(debug, L"[TRAFFIC] Session type: 0x%02x (%s)", sessionType,
-             sessionType == 0x01 ? L"INIT" : (sessionType == 0x02 ? L"ACK" : (sessionType == 0x03 ? L"TRAFFIC" : L"UNKNOWN")));
-    AddLog(debug, LOG_INFO);
-    
-    string srcHex = GetKeyPrefix(srcKey);
-    
+
     EnterCriticalSection(&m_sessionsLock);
     
     // Ищем сессию
@@ -1460,9 +1435,13 @@ void IronPeer::HandleTraffic(const BYTE* packet, DWORD len) {
     switch (sessionType) {
         case SESSION_INIT:
         case SESSION_ACK: {
-            wsprintf(debug, L"[TRAFFIC] Session %s from %S", 
-                     sessionType == SESSION_INIT ? L"INIT" : L"ACK", srcHex.c_str());
-            AddLog(debug, LOG_INFO);
+            {
+                string srcHex = GetKeyPrefix(srcKey);
+                WCHAR debug[128];
+                wsprintf(debug, L"[TRAFFIC] Session %s from %S",
+                         sessionType == SESSION_INIT ? L"INIT" : L"ACK", srcHex.c_str());
+                AddLog(debug, LOG_INFO);
+            }
             
             if (!session) {
                 // Создаем новую сессию
@@ -1503,7 +1482,7 @@ void IronPeer::HandleTraffic(const BYTE* packet, DWORD len) {
                         return 0;
                     }
                 };
-                HANDLE hT = CreateThread(NULL, 0, Local::HandshakeThreadProc, hargs, 0, NULL);
+                HANDLE hT = CreateThread(NULL, 128 * 1024, Local::HandshakeThreadProc, hargs, 0, NULL);
                 if (hT) {
                     SetThreadPriority(hT, THREAD_PRIORITY_BELOW_NORMAL);
                     CloseHandle(hT);
@@ -1522,18 +1501,12 @@ void IronPeer::HandleTraffic(const BYTE* packet, DWORD len) {
             if (session) {
                 session->HandleSessionTraffic(sessionPacket, sessionLen, this);
                 session->Release();
-            } else {
-                wsprintf(debug, L"[TRAFFIC] No session for %S, dropping", srcHex.c_str());
-                AddLog(debug, LOG_WARN);
             }
             return;  // session уже released выше для TRAFFIC
         }
-        
-        default: {
-            wsprintf(debug, L"[TRAFFIC] Unknown session type: 0x%02x", sessionType);
-            AddLog(debug, LOG_WARN);
+
+        default:
             break;
-        }
     }
     
     if (session) {
@@ -1576,6 +1549,8 @@ DWORD WINAPI IronPeer::KeepaliveThreadProc(LPVOID lpParam) {
     const int MAX_FAILS = 3;
     DWORD lastKeepalive = GetTickCount();
     DWORD lastSigReq = GetTickCount();
+    DWORD lastPendingCleanup = GetTickCount();
+    DWORD lastSessionCleanup = GetTickCount();
 
     AddLog(L"[Keepalive] Thread started", LOG_DEBUG);
 
@@ -1597,6 +1572,49 @@ DWORD WINAPI IronPeer::KeepaliveThreadProc(LPVOID lpParam) {
             if (pThis->m_bConnected) {
                 AddLog(L"[Keepalive] Sending periodic SIG_REQ", LOG_DEBUG);
                 pThis->SendSigReq();
+            }
+        }
+
+        // Очистка протухших pending сессий каждые 30 секунд
+        if ((now - lastPendingCleanup) >= 30000) {
+            lastPendingCleanup = now;
+            EnterCriticalSection(&pThis->m_pendingLock);
+            for (int pi = (int)pThis->m_pendingSessions.size() - 1; pi >= 0; pi--) {
+                if ((now - pThis->m_pendingSessions[pi].createdTime) > 30000) {
+                    WCHAR dbg[256];
+                    wsprintf(dbg, L"[Keepalive] Dropping stale pending session (no PATH_NOTIFY in 30s): %02x%02x%02x%02x...",
+                             pThis->m_pendingSessions[pi].targetIPv6[0], pThis->m_pendingSessions[pi].targetIPv6[1],
+                             pThis->m_pendingSessions[pi].targetIPv6[2], pThis->m_pendingSessions[pi].targetIPv6[3]);
+                    AddLog(dbg, LOG_DEBUG);
+                    pThis->m_pendingSessions.erase(pThis->m_pendingSessions.begin() + pi);
+                }
+            }
+            LeaveCriticalSection(&pThis->m_pendingLock);
+        }
+
+        // Очистка неактивных Ironwood-сессий каждые 30 секунд (таймаут 60 сек)
+        // Close()/Release() вызываем вне лока чтобы не блокировать receive-поток.
+        if ((now - lastSessionCleanup) >= 30000) {
+            lastSessionCleanup = now;
+            vector<IronSession*> toEvict;
+            EnterCriticalSection(&pThis->m_sessionsLock);
+            for (int si = (int)pThis->m_sessions.size() - 1; si >= 0; si--) {
+                IronSession* s = pThis->m_sessions[si];
+                if (s->IsTimedOut(60000)) {
+                    toEvict.push_back(s);
+                    pThis->m_sessions.erase(pThis->m_sessions.begin() + si);
+                }
+            }
+            LeaveCriticalSection(&pThis->m_sessionsLock);
+            for (size_t ei = 0; ei < toEvict.size(); ei++) {
+                WCHAR dbg[256];
+                const BYTE* ipv6 = toEvict[ei]->GetRemoteIPv6();
+                wsprintf(dbg, L"[Keepalive] Evicting idle session %02x%02x:%02x%02x:%02x%02x:%02x%02x...",
+                         ipv6[0], ipv6[1], ipv6[2], ipv6[3],
+                         ipv6[4], ipv6[5], ipv6[6], ipv6[7]);
+                AddLog(dbg, LOG_DEBUG);
+                toEvict[ei]->Close();
+                toEvict[ei]->Release();
             }
         }
 
@@ -1647,12 +1665,37 @@ DWORD WINAPI IronPeer::SessionInitThreadProc(LPVOID lpParam) {
     AddLog(debug, LOG_INFO);
     
     bool sent = args->session->SendSessionInit(args->peer, args->path);
-    
+
     wsprintf(debug, L"[PENDING_FULL] SESSION_INIT sent: %s", sent ? L"SUCCESS" : L"FAILED");
     AddLog(debug, sent ? LOG_SUCCESS : LOG_ERROR);
-    
+
+    args->session->Release();  // парный AddRef из вызывающего кода
     delete args;
     return 0;
+}
+
+// Запускает SendSessionInit в фоновом потоке (чтобы не блокировать recv-поток).
+// AddRef/Release управляется внутри SessionInitThreadProc через args->session.
+void IronSession::SendSessionInitAsync(IronPeer* peer, const vector<BYTE>& path) {
+    struct SessionInitArgs {
+        IronSession* session;
+        IronPeer* peer;
+        vector<BYTE> path;
+    };
+    SessionInitArgs* args = new SessionInitArgs();
+    args->session = this;
+    args->session->AddRef();
+    args->peer = peer;
+    args->path = path;
+    HANDLE hThread = CreateThread(NULL, 128 * 1024, IronPeer::SessionInitThreadProc, args, 0, NULL);
+    if (hThread) {
+        SetThreadPriority(hThread, THREAD_PRIORITY_BELOW_NORMAL);
+        CloseHandle(hThread);
+    } else {
+        // Не отправляем — recv-поток не должен блокироваться
+        args->session->Release();
+        delete args;
+    }
 }
 
 // ============================================================================
@@ -1941,13 +1984,21 @@ void IronPeer::CheckPendingSessionsWithFullKey(const BYTE* fullKey, const vector
             wsprintf(debug, L"[PENDING_FULL] Found matching session for port %d", m_pendingSessions[i].targetPort);
             AddLog(debug, LOG_SUCCESS);
             
-            // Закрываем старые сессии к этому же адресу (чтобы не было путаницы)
+            // Под одним локом: закрываем старые не-ESTABLISHED сессии и проверяем наличие ESTABLISHED
+            bool hasEstablished = false;
             EnterCriticalSection(&m_sessionsLock);
-            for (int j = m_sessions.size() - 1; j >= 0; j--) {
+            for (int j = (int)m_sessions.size() - 1; j >= 0; j--) {
                 if (memcmp(m_sessions[j]->GetRemoteKey(), fullKey, 16) == 0) {
-                    // НЕ закрываем ESTABLISHED сессии
                     if (m_sessions[j]->GetTcpState() == TCP_ESTABLISHED && !m_sessions[j]->IsClosed()) {
                         AddLog(L"[PENDING_FULL] Keep existing ESTABLISHED session", LOG_DEBUG);
+                        hasEstablished = true;
+                        continue;
+                    }
+                    // Не убиваем сессию которая ещё инициализируется (SESSION_INIT в процессе)
+                    // HTTP-поток её найдёт и дождётся через GetSessionForIPv6
+                    if (!m_sessions[j]->IsClosed() && !m_sessions[j]->IsReady()) {
+                        AddLog(L"[PENDING_FULL] SESSION_INIT in progress — keeping session", LOG_DEBUG);
+                        hasEstablished = true;  // чтобы не создавать новую
                         continue;
                     }
                     wsprintf(debug, L"[PENDING_FULL] Closing old session %d to same target", j);
@@ -1959,42 +2010,40 @@ void IronPeer::CheckPendingSessionsWithFullKey(const BYTE* fullKey, const vector
             }
             LeaveCriticalSection(&m_sessionsLock);
             
-            // Проверяем, нет ли уже ESTABLISHED сессии
-            bool hasEstablished = false;
-            for (size_t k = 0; k < m_sessions.size(); k++) {
-                if (memcmp(m_sessions[k]->GetRemoteKey(), fullKey, 16) == 0 && 
-                    m_sessions[k]->GetTcpState() == TCP_ESTABLISHED && !m_sessions[k]->IsClosed()) {
-                    AddLog(L"[PENDING_FULL] Session already ESTABLISHED, skipping creation", LOG_INFO);
-                    hasEstablished = true;
-                    break;
-                }
-            }
-            
             if (hasEstablished) {
-                LeaveCriticalSection(&m_pendingLock);
+                // НЕ отпускаем m_pendingLock перед continue — мы всё ещё внутри цикла по m_pendingSessions
+                ++i;
                 continue;
             }
             
+            // Копируем всё нужное из m_pendingSessions[i] пока держим m_pendingLock
+            int pendingPort = m_pendingSessions[i].targetPort;
+
+            // Удаляем из pending сразу — до отпускания лока, чтобы индекс не протух
+            m_pendingSessions.erase(m_pendingSessions.begin() + i);
+            // i не инкрементируем — erase сдвинул следующий элемент на место i
+
             // Создаем сессию с ПОЛНЫМ ключом из PATH_NOTIFY
-            IronSession* session = new IronSession(fullKey, m_pendingSessions[i].targetPort, 1);
-            
+            IronSession* session = new IronSession(fullKey, pendingPort, 1);
+
             WCHAR debug2[256];
-            wsprintf(debug2, L"[PENDING_FULL] Creating session with key[0..3]=%02x%02x%02x%02x, port=%d", 
-                     fullKey[0], fullKey[1], fullKey[2], fullKey[3], m_pendingSessions[i].targetPort);
+            wsprintf(debug2, L"[PENDING_FULL] Creating session with key[0..3]=%02x%02x%02x%02x, port=%d",
+                     fullKey[0], fullKey[1], fullKey[2], fullKey[3], pendingPort);
             AddLog(debug2, LOG_INFO);
-            
+
             session->Initialize();
-            
+            session->SetRemoteIPv6(derivedIPv6);  // Сохраняем реальный IPv6 узла для Host-заголовка
+
             EnterCriticalSection(&m_sessionsLock);
             m_sessions.push_back(session);
             LeaveCriticalSection(&m_sessionsLock);
-            
+
             wsprintf(debug, L"[PENDING_FULL] Session created with full key, path len=%d", path.size());
             AddLog(debug, LOG_INFO);
-            
-            // Отправляем SESSION_INIT асинхронно (чтобы не блокировать receive thread!)
+
+            // Отправляем SESSION_INIT асинхронно — отпускаем m_pendingLock на время потока
             LeaveCriticalSection(&m_pendingLock);
-            
+
             // Создаем структуру для передачи в поток
             struct SessionInitArgs {
                 IronSession* session;
@@ -2003,11 +2052,12 @@ void IronPeer::CheckPendingSessionsWithFullKey(const BYTE* fullKey, const vector
             };
             SessionInitArgs* args = new SessionInitArgs();
             args->session = session;
+            args->session->AddRef();  // парный Release в SessionInitThreadProc
             args->peer = this;
             args->path = path;
-            
-            HANDLE hInitThread = CreateThread(NULL, 0, SessionInitThreadProc, args, 0, NULL);
-            
+
+            HANDLE hInitThread = CreateThread(NULL, 128 * 1024, SessionInitThreadProc, args, 0, NULL);
+
             if (hInitThread) {
                 SetThreadPriority(hInitThread, THREAD_PRIORITY_BELOW_NORMAL);
                 CloseHandle(hInitThread);
@@ -2019,11 +2069,9 @@ void IronPeer::CheckPendingSessionsWithFullKey(const BYTE* fullKey, const vector
                 AddLog(debug, sent ? LOG_SUCCESS : LOG_ERROR);
                 delete args;
             }
-            
+
             EnterCriticalSection(&m_pendingLock);
-            
-            // Удаляем из pending
-            m_pendingSessions.erase(m_pendingSessions.begin() + i);
+            // erase уже сделан выше, i уже указывает на следующий элемент — continue не нужен
         } else {
             ++i;
         }
@@ -2060,7 +2108,7 @@ void IronPeer::CheckPendingSessions(const string& prefix) {
             
             // Закрываем старые сессии к этому адресу
             EnterCriticalSection(&m_sessionsLock);
-            for (int j = m_sessions.size() - 1; j >= 0; j--) {
+            for (int j = (int)m_sessions.size() - 1; j >= 0; j--) {
                 if (memcmp(m_sessions[j]->GetRemoteKey(), m_pendingSessions[i].targetKey, 16) == 0) {
                     // НЕ закрываем ESTABLISHED сессии
                     if (m_sessions[j]->GetTcpState() == TCP_ESTABLISHED && !m_sessions[j]->IsClosed()) {
@@ -2076,15 +2124,23 @@ void IronPeer::CheckPendingSessions(const string& prefix) {
             }
             LeaveCriticalSection(&m_sessionsLock);
             
+            // Копируем данные из m_pendingSessions[i] пока держим m_pendingLock
+            BYTE pendingKey[32];
+            memcpy(pendingKey, m_pendingSessions[i].targetKey, 32);
+            int pendingPort2 = m_pendingSessions[i].targetPort;
+
+            // Удаляем из pending сразу — до отпускания лока
+            m_pendingSessions.erase(m_pendingSessions.begin() + i);
+            // i не инкрементируем — erase сдвинул следующий элемент на место i
+
             // Создаем сессию
-            IronSession* session = new IronSession(m_pendingSessions[i].targetKey, 
-                                                    m_pendingSessions[i].targetPort, 1);
+            IronSession* session = new IronSession(pendingKey, pendingPort2, 1);
             session->Initialize();
-            
+
             EnterCriticalSection(&m_sessionsLock);
             m_sessions.push_back(session);
             LeaveCriticalSection(&m_sessionsLock);
-            
+
             // Получаем путь
             NodeRoute* route = GetRoute(prefix);
             vector<BYTE> path;
@@ -2097,16 +2153,14 @@ void IronPeer::CheckPendingSessions(const string& prefix) {
                 path.push_back(0);
                 AddLog(L"[PENDING] Using empty path", LOG_DEBUG);
             }
-            
+
             // Отправляем SESSION_INIT
             LeaveCriticalSection(&m_pendingLock);
             bool sent = session->SendSessionInit(this, path);
             wsprintf(debug, L"[PENDING] SESSION_INIT sent: %s", sent ? L"SUCCESS" : L"FAILED");
             AddLog(debug, sent ? LOG_SUCCESS : LOG_ERROR);
             EnterCriticalSection(&m_pendingLock);
-            
-            // Удаляем из pending
-            m_pendingSessions.erase(m_pendingSessions.begin() + i);
+            // erase уже сделан выше, i уже указывает на следующий элемент — continue не нужен
         } else {
             ++i;
         }

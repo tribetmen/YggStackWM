@@ -2,21 +2,24 @@
 #include <windows.h>
 #include <wincrypt.h>
 
-void randombytes(unsigned char *x, unsigned long long xlen) {
-    HCRYPTPROV hProv = 0;
-    unsigned long long i;  // Объявляем ВСЕ переменные в начале
-    
-    // Получаем криптографический провайдер
-    if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, 
+/* Кешируем провайдер — CryptAcquireContext грузит rsaenh.dll каждый раз */
+static HCRYPTPROV s_hProv = 0;
+
+static HCRYPTPROV GetCachedProvider(void) {
+    if (s_hProv != 0) return s_hProv;
+    if (!CryptAcquireContext(&s_hProv, NULL, NULL, PROV_RSA_FULL,
                              CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
-        // Если не получилось - заполняем нулями (плохо, но не падаем)
+        s_hProv = 0;
+    }
+    return s_hProv;
+}
+
+void randombytes(unsigned char *x, unsigned long long xlen) {
+    unsigned long long i;
+    HCRYPTPROV hProv = GetCachedProvider();
+    if (!hProv) {
         for (i = 0; i < xlen; i++) x[i] = 0;
         return;
     }
-    
-    // Генерируем случайные байты
     CryptGenRandom(hProv, (DWORD)xlen, x);
-    
-    // Освобождаем провайдер
-    CryptReleaseContext(hProv, 0);
 }

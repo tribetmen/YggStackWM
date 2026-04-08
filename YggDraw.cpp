@@ -1,4 +1,4 @@
-// YggDraw.cpp - Отрисовка интерфейса
+// YggDraw.cpp - Отрисовка интерфейса (Material-style)
 
 #include "stdafx.h"
 #include "YggDraw.h"
@@ -6,649 +6,857 @@
 #include "YggInput.h"
 #include "YggdrasilCore.h"
 
-// Цвета
-#define COLOR_INFO      RGB(0, 0, 180)
-#define COLOR_WARN      RGB(180, 100, 0)
-#define COLOR_ERROR     RGB(200, 0, 0)
-#define COLOR_DEBUG     RGB(100, 100, 100)
-#define COLOR_SUCCESS   RGB(0, 140, 0)
-#define MY_COLOR_PRIMARY     RGB(41, 98, 255)
-#define MY_COLOR_PRIMARY_DARK RGB(25, 60, 170)
-#define MY_COLOR_SUCCESS     RGB(40, 200, 100)
-#define MY_COLOR_WARNING     RGB(255, 170, 0)
-#define MY_COLOR_BG          RGB(250, 250, 250)
-#define MY_COLOR_CARD        RGB(255, 255, 255)
-#define MY_COLOR_TEXT        RGB(30, 30, 30)
-#define MY_COLOR_TEXT_LIGHT  RGB(120, 120, 120)
-#define MY_COLOR_BORDER      RGB(220, 220, 220)
-#define MY_COLOR_HIGHLIGHT   RGB(240, 240, 250)
-#define MY_COLOR_FOCUS       RGB(255, 0, 0)
+#ifndef PS_DOT
+#define PS_DOT 2
+#endif
 
-// Внешние переменные объявлены в YggInput.h
-// Дополнительные переменные только для этого модуля:
-extern int g_totalHeight;
+// ============================================================================
+// Цвета
+// ============================================================================
+#define C_BG            RGB(235, 237, 242)   // серый фон страницы
+#define C_CARD          RGB(255, 255, 255)   // белая карточка
+#define C_PRIMARY       RGB(52, 100, 210)    // синий основной
+#define C_PRIMARY_DARK  RGB(30,  65, 160)    // тёмно-синий
+#define C_SUCCESS       RGB(52, 199, 120)    // зелёный
+#define C_DANGER        RGB(220,  53,  69)   // красный
+#define C_WARNING       RGB(255, 160,   0)   // жёлтый
+#define C_TEXT          RGB( 28,  28,  35)   // основной текст
+#define C_TEXT_LIGHT    RGB(120, 125, 140)   // серый текст
+#define C_BORDER        RGB(210, 213, 220)   // граница карточки
+#define C_SECTION_HDR   RGB( 28,  28,  35)   // заголовок секции (тёмный)
+#define C_TOGGLE_OFF    RGB(180, 185, 195)   // переключатель выкл
+
+// Логи
+#define COLOR_INFO      RGB(  0,   0, 180)
+#define COLOR_WARN      RGB(180, 100,   0)
+#define COLOR_ERROR     RGB(200,   0,   0)
+#define COLOR_DEBUG     RGB(120, 120, 120)
+#define COLOR_SUCCESS   RGB(  0, 140,   0)
+
+extern int  g_totalHeight;
 extern WCHAR g_currentIP[50];
 
 // Буфер отрисовки
-HBITMAP g_hBackBuffer = NULL;
-HDC g_hBackDC = NULL;
-int g_backBufferWidth = 0;
-int g_backBufferHeight = 0;
+HBITMAP g_hBackBuffer    = NULL;
+HDC     g_hBackDC        = NULL;
+int     g_backBufferWidth  = 0;
+int     g_backBufferHeight = 0;
 
 void CreateBackBuffer(HDC hdc, int width, int height) {
-    if (g_hBackBuffer != NULL) {
-        DeleteObject(g_hBackBuffer);
-        DeleteDC(g_hBackDC);
-    }
-    g_hBackDC = CreateCompatibleDC(hdc);
+    if (g_hBackBuffer) { DeleteObject(g_hBackBuffer); DeleteDC(g_hBackDC); }
+    g_hBackDC     = CreateCompatibleDC(hdc);
     g_hBackBuffer = CreateCompatibleBitmap(hdc, width, height);
-    g_backBufferWidth = width;
+    g_backBufferWidth  = width;
     g_backBufferHeight = height;
     SelectObject(g_hBackDC, g_hBackBuffer);
 }
 
+// ============================================================================
+// Вспомогательные функции рисования
+// ============================================================================
+
+// Радиус скругления карточек
+#define CARD_RADIUS 6
+
+// Скруглённый прямоугольник с заливкой и рамкой
+static void FillRoundCard(HDC hdc, RECT* rc, COLORREF fill, COLORREF border) {
+    HPEN   pen   = CreatePen(PS_SOLID, 1, border);
+    HBRUSH br    = CreateSolidBrush(fill);
+    HGDIOBJ op   = SelectObject(hdc, pen);
+    HGDIOBJ ob   = SelectObject(hdc, br);
+    RoundRect(hdc, rc->left, rc->top, rc->right, rc->bottom, CARD_RADIUS*2, CARD_RADIUS*2);
+    SelectObject(hdc, op);
+    SelectObject(hdc, ob);
+    DeleteObject(pen);
+    DeleteObject(br);
+}
+
+// Рамка без заливки (прямоугольная, для полей ввода и т.п.)
 void DrawFrameRect(HDC hdc, RECT* rc, COLORREF color) {
-    HPEN hPen = CreatePen(PS_SOLID, 1, color);
-    HGDIOBJ oldPen = SelectObject(hdc, hPen);
+    HPEN   pen      = CreatePen(PS_SOLID, 1, color);
+    HGDIOBJ oldPen   = SelectObject(hdc, pen);
     HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
     Rectangle(hdc, rc->left, rc->top, rc->right, rc->bottom);
     SelectObject(hdc, oldPen);
     SelectObject(hdc, oldBrush);
-    DeleteObject(hPen);
+    DeleteObject(pen);
+}
+
+// Залитая карточка со скруглёнными углами
+static void FillCard(HDC hdc, RECT* rc, COLORREF fill, COLORREF border) {
+    FillRoundCard(hdc, rc, fill, border);
+}
+
+// Горизонтальная линия-разделитель
+static void DrawDivider(HDC hdc, int x0, int x1, int y, COLORREF color) {
+    HPEN pen    = CreatePen(PS_SOLID, 1, color);
+    HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+    MoveToEx(hdc, x0, y, NULL);
+    LineTo(hdc, x1, y);
+    SelectObject(hdc, oldPen);
+    DeleteObject(pen);
+}
+
+// Кнопка удаления — красный фон, крестик «X»
+static void DrawDeleteBtn(HDC hdc, RECT* rc) {
+    // Квадратная зона для симметричного крестика — берём меньшую сторону
+    int w  = rc->right  - rc->left;
+    int h  = rc->bottom - rc->top;
+    int sz = (w < h) ? w : h;  // квадрат по меньшей стороне
+    int cx = (rc->left + rc->right)  / 2;
+    int cy = (rc->top  + rc->bottom) / 2;
+    int pad = sz / 4;
+
+    HPEN pen = CreatePen(PS_SOLID, 2, C_TEXT);
+    HPEN old = (HPEN)SelectObject(hdc, pen);
+    MoveToEx(hdc, cx - sz/2 + pad, cy - sz/2 + pad, NULL); LineTo(hdc, cx + sz/2 - pad, cy + sz/2 - pad);
+    MoveToEx(hdc, cx + sz/2 - pad, cy - sz/2 + pad, NULL); LineTo(hdc, cx - sz/2 + pad, cy + sz/2 - pad);
+    SelectObject(hdc, old);
+    DeleteObject(pen);
+}
+
+// Toggle-переключатель со скруглёнными углами
+static void DrawToggle(HDC hdc, RECT* rc, BOOL on) {
+    int w  = rc->right  - rc->left;
+    int h  = rc->bottom - rc->top;
+    int r  = h; // радиус = высота (таблетка)
+
+    COLORREF bg  = on ? C_PRIMARY : C_TOGGLE_OFF;
+    COLORREF brd = on ? C_PRIMARY_DARK : C_BORDER;
+    HPEN   pen = CreatePen(PS_SOLID, 1, brd);
+    HBRUSH br  = CreateSolidBrush(bg);
+    HGDIOBJ op = SelectObject(hdc, pen);
+    HGDIOBJ ob = SelectObject(hdc, br);
+    RoundRect(hdc, rc->left, rc->top, rc->right, rc->bottom, r, r);
+    SelectObject(hdc, op);
+    SelectObject(hdc, ob);
+    DeleteObject(pen);
+    DeleteObject(br);
+
+    // Белый кружок-ползунок
+    int sz  = h - 4;
+    int cx  = on ? (rc->right - 2 - sz) : (rc->left + 2);
+    HPEN   pp  = CreatePen(PS_SOLID, 1, RGB(200,200,200));
+    HBRUSH dpb = CreateSolidBrush(RGB(255,255,255));
+    HGDIOBJ op2 = SelectObject(hdc, pp);
+    HGDIOBJ ob2 = SelectObject(hdc, dpb);
+    Ellipse(hdc, cx, rc->top + 2, cx + sz, rc->top + 2 + sz);
+    SelectObject(hdc, op2);
+    SelectObject(hdc, ob2);
+    DeleteObject(pp);
+    DeleteObject(dpb);
 }
 
 COLORREF GetLogColor(BYTE type) {
     switch(type) {
-        case LOG_INFO: return COLOR_INFO;
-        case LOG_WARN: return COLOR_WARN;
-        case LOG_ERROR: return COLOR_ERROR;
-        case LOG_DEBUG: return COLOR_DEBUG;
+        case LOG_INFO:    return COLOR_INFO;
+        case LOG_WARN:    return COLOR_WARN;
+        case LOG_ERROR:   return COLOR_ERROR;
+        case LOG_DEBUG:   return COLOR_DEBUG;
         case LOG_SUCCESS: return COLOR_SUCCESS;
-        default: return MY_COLOR_TEXT;
+        default:          return C_TEXT;
     }
+}
+
+// ============================================================================
+// Масштабирование
+// ============================================================================
+
+// Базовая единица — % от ширины экрана для горизонтали,
+// фиксированные пиксели для вертикали с коэф. масштаба.
+static int Scale(int px, int width) {
+    // Базовая ширина 240px. На 480px удваиваем и т.д.
+    if (width >= 640) return px * 3 / 2;
+    if (width >= 480) return px * 5 / 4;
+    return px;
+}
+
+// ============================================================================
+// Карточка-секция (заголовок + контент внутри белой карточки)
+// ============================================================================
+
+// Рисует заголовок секции (над карточкой)
+// Возвращает новый y после заголовка
+static int DrawSectionHeader(HDC hdc, int x0, int x1, int y, int scrollY, LPCWSTR title, int hdr) {
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, C_TEXT_LIGHT);
+    RECT rc = { x0, y - scrollY, x1, y - scrollY + hdr };
+    DrawText(hdc, title, -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    return y + hdr;
+}
+
+// ============================================================================
+// Верхняя панель
+// ============================================================================
+
+// Высота нашей шапки (без системного трея): 32px на маленьких, 44px на больших
+static int TopBarHeight(int width) {
+    return (width >= 480) ? 44 : 32;
 }
 
 void DrawTopPanel(HDC hdc, int width) {
-    if (!g_isButtonPhone) {
-        RECT rcTop = {0, g_topPanelY, width, g_topPanelY + 40};
-        HBRUSH topBrush = CreateSolidBrush(MY_COLOR_PRIMARY);
-        FillRect(hdc, &rcTop, topBrush);
-        DeleteObject(topBrush);
-        
-        SetTextColor(hdc, RGB(255, 255, 255));
+    if (g_isButtonPhone) {
+        // Компактная строка состояния
+        RECT rc = { 0, 0, width, 20 };
+        HBRUSH br = CreateSolidBrush(C_PRIMARY_DARK);
+        FillRect(hdc, &rc, br);
+        DeleteObject(br);
+        SetTextColor(hdc, RGB(255,255,255));
         SetBkMode(hdc, TRANSPARENT);
-        
-        WCHAR statusText[64];
-        wsprintf(statusText, L"Service: %s", 
-                 g_serviceRunning ? L"Running" : (g_connecting ? L"Connecting..." : L"Stopped"));
-        SetTextColor(hdc, g_serviceRunning ? MY_COLOR_SUCCESS : 
-                          (g_connecting ? MY_COLOR_WARNING : RGB(255, 200, 200)));
-        RECT rcStatus = {10, g_topPanelY + 5, width - 10, g_topPanelY + 25};
-        DrawText(hdc, statusText, -1, &rcStatus, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        WCHAR s[64];
+        wsprintf(s, L"%s", g_serviceRunning ? L"Running" : (g_connecting ? L"Connecting..." : L"Stopped"));
+        RECT rcS = { 5, 2, width-5, 18 };
+        DrawText(hdc, s, -1, &rcS, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     } else {
-        // Компактный статус-бар для кнопочных
-        RECT rcTop = {0, 0, width, 20};
-        HBRUSH topBrush = CreateSolidBrush(MY_COLOR_PRIMARY_DARK);
-        FillRect(hdc, &rcTop, topBrush);
-        DeleteObject(topBrush);
-        
-        SetTextColor(hdc, RGB(255, 255, 255));
+        // Белая шапка с тенью
+        int barH = TopBarHeight(width);
+        int h = g_topPanelY + barH;
+        RECT rc = { 0, g_topPanelY, width, h };
+        HBRUSH br = CreateSolidBrush(C_CARD);
+        FillRect(hdc, &rc, br);
+        DeleteObject(br);
+        DrawDivider(hdc, 0, width, h - 1, C_BORDER);
+
         SetBkMode(hdc, TRANSPARENT);
-        
-        WCHAR statusText[64];
-        wsprintf(statusText, L"%s", 
-                 g_serviceRunning ? L"Running" : (g_connecting ? L"Connecting..." : L"Stopped"));
-        RECT rcStatus = {5, 2, width - 5, 18};
-        DrawText(hdc, statusText, -1, &rcStatus, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        COLORREF statusColor = g_serviceRunning ? C_SUCCESS : (g_connecting ? C_WARNING : C_DANGER);
+        LPCWSTR  statusText  = g_serviceRunning ? L"Connected" : (g_connecting ? L"Connecting..." : L"Disconnected");
+
+        // Цветной прямоугольник-индикатор слева
+        RECT rcBar = { 0, g_topPanelY, 4, h };
+        HBRUSH barBr = CreateSolidBrush(statusColor);
+        FillRect(hdc, &rcBar, barBr);
+        DeleteObject(barBr);
+
+        // Текст статуса — цветной, по центру по вертикали
+        SetTextColor(hdc, statusColor);
+        RECT rcS = { 12, g_topPanelY, width - 10, h };
+        DrawText(hdc, statusText, -1, &rcS, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
 }
+
+// ============================================================================
+// Нижняя панель с вкладками
+// ============================================================================
 
 void DrawBottomPanel(HDC hdc, int width, int height) {
-    int panelHeight = g_isButtonPhone ? 30 : ((height >= 640) ? 55 : ((height >= 480) ? 50 : 45));
-    int y = height - panelHeight + 5;
-    
+    int tabH = g_isButtonPhone ? 30 : Scale(48, width);
+    int y0   = height - tabH;
+
+    RECT rcPanel = { 0, y0, width, height };
+    HBRUSH br = CreateSolidBrush(C_CARD);
+    FillRect(hdc, &rcPanel, br);
+    DeleteObject(br);
+    DrawDivider(hdc, 0, width, y0, C_BORDER);
+
+    SetBkMode(hdc, TRANSPARENT);
+
     if (g_isButtonPhone) {
-        // Компактная панель для кнопочных
-        RECT rcPanel = {0, height - panelHeight, width, height};
-        HBRUSH panelBrush = CreateSolidBrush(MY_COLOR_PRIMARY_DARK);
-        FillRect(hdc, &rcPanel, panelBrush);
-        DeleteObject(panelBrush);
-        
-        HPEN pen = CreatePen(PS_SOLID, 1, RGB(100, 100, 100));
-        HGDIOBJ oldPen = SelectObject(hdc, pen);
-        MoveToEx(hdc, 0, height - panelHeight, NULL);
-        LineTo(hdc, width, height - panelHeight);
-        SelectObject(hdc, oldPen);
-        DeleteObject(pen);
-        
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, RGB(255, 255, 255));
-        
-        // Левая софт-клавиша
-        RECT rcLeftSoft = {5, y, width / 3, y + panelHeight - 4};
-        LPCWSTR leftLabel = L"[OK]";
-        if (g_addingPeer || g_editingKey) leftLabel = L"[Save]";
-        else if (g_currentTab == 0 && g_focusIndex == 0) 
-            leftLabel = g_serviceRunning ? L"[Stop]" : L"[Start]";
-        DrawText(hdc, leftLabel, -1, &rcLeftSoft, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        
-        // Центр - название вкладки
-        RECT rcCenter = {width / 3, y, width * 2 / 3, y + panelHeight - 4};
-        LPCWSTR tabName = (g_currentTab == 0) ? L"CONFIG" : 
-                         (g_currentTab == 1) ? L"LOGS" : L"INFO";
-        DrawText(hdc, tabName, -1, &rcCenter, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        
-        // Правая софт-клавиша
-        RECT rcRightSoft = {width * 2 / 3, y, width - 5, y + panelHeight - 4};
-        LPCWSTR rightLabel = (g_addingPeer || g_editingKey) ? L"[Cancel]" : L"[Back]";
-        DrawText(hdc, rightLabel, -1, &rcRightSoft, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-        
+        // Мягкие кнопки
+        int my = y0 + 5;
+        SetTextColor(hdc, RGB(255,255,255));
+        RECT rcL = { 5, my, width/3, my + tabH - 8 };
+        LPCWSTR lbl = L"[OK]";
+        if (g_addingPeer || g_editingKey || g_addingDns) lbl = L"[Save]";
+        else if (g_currentTab == 0 && g_focusIndex == 0)
+            lbl = g_serviceRunning ? L"[Stop]" : L"[Start]";
+        HBRUSH pbr = CreateSolidBrush(C_PRIMARY_DARK);
+        FillRect(hdc, &rcPanel, pbr); DeleteObject(pbr);
+        SetTextColor(hdc, RGB(255,255,255));
+        DrawText(hdc, lbl, -1, &rcL, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        RECT rcC = { width/3, my, width*2/3, my + tabH - 8 };
+        LPCWSTR tab = g_currentTab==0?L"CONFIG":g_currentTab==1?L"LOGS":L"INFO";
+        DrawText(hdc, tab, -1, &rcC, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        RECT rcR = { width*2/3, my, width-5, my + tabH - 8 };
+        LPCWSTR rl = (g_addingPeer||g_editingKey||g_addingDns) ? L"[Cancel]" : L"[Back]";
+        DrawText(hdc, rl, -1, &rcR, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
         return;
     }
-    
-    // Сенсорная панель
-    RECT rcPanel = {0, height - panelHeight, width, height};
-    HBRUSH panelBrush = CreateSolidBrush(MY_COLOR_CARD);
-    FillRect(hdc, &rcPanel, panelBrush);
-    DeleteObject(panelBrush);
-    
-    HPEN pen = CreatePen(PS_SOLID, 1, MY_COLOR_BORDER);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    MoveToEx(hdc, 0, height - panelHeight, NULL);
-    LineTo(hdc, width, height - panelHeight);
-    SelectObject(hdc, oldPen);
-    DeleteObject(pen);
-    
-    int margin = (width >= 640) ? 10 : ((width >= 480) ? 8 : 5);
-    int btnWidth = (width - (margin * 4)) / 3;
-    int btnHeight = panelHeight - 10;
-    
-    COLORREF bgColors[3] = {MY_COLOR_CARD, MY_COLOR_CARD, MY_COLOR_CARD};
-    COLORREF textColors[3] = {MY_COLOR_TEXT, MY_COLOR_TEXT, MY_COLOR_TEXT};
-    bgColors[g_currentTab] = MY_COLOR_PRIMARY;
-    textColors[g_currentTab] = RGB(255, 255, 255);
-    
+
+    // Три вкладки равной ширины
+    int tw = width / 3;
+    LPCWSTR labels[3] = { L"Configuration", L"Diagnostics", L"Info" };
     for (int i = 0; i < 3; i++) {
-        RECT rcBtn = {margin * (i + 1) + btnWidth * i, y, 
-                      margin * (i + 1) + btnWidth * (i + 1), y + btnHeight};
-        HBRUSH brush = CreateSolidBrush(bgColors[i]);
-        FillRect(hdc, &rcBtn, brush);
-        DeleteObject(brush);
-        SetTextColor(hdc, textColors[i]);
-        LPCWSTR label = (i == 0) ? L"Conf" : (i == 1) ? L"Logs" : L"Info";
-        DrawText(hdc, label, -1, &rcBtn, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        int x0 = i * tw, x1 = (i == 2) ? width : x0 + tw;
+        BOOL active = (g_currentTab == i);
+        // Подчёркивание активной
+        if (active) {
+            RECT rcLine = { x0 + 4, height - 3, x1 - 4, height };
+            HBRUSH lb = CreateSolidBrush(C_PRIMARY);
+            FillRect(hdc, &rcLine, lb);
+            DeleteObject(lb);
+        }
+        SetTextColor(hdc, active ? C_PRIMARY : C_TEXT_LIGHT);
+        RECT rcTab = { x0, y0, x1, height - 3 };
+        DrawText(hdc, labels[i], -1, &rcTab, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 }
 
+// ============================================================================
+// Config вкладка
+// ============================================================================
+
 void DrawConfigTab(HDC hdc, int width, int height, int scrollY) {
-    int margin = (width >= 640) ? 30 : ((width >= 480) ? 20 : 5);
-    int sectionHeight = g_isButtonPhone ? 35 : ((height >= 640) ? 30 : 25);
-    int keyFieldHeight = (width >= 640) ? 70 : ((width >= 480) ? 65 : 55);
-    int peerItemHeight = g_isButtonPhone ? 28 : ((height >= 640) ? 26 : 22);
-    
-    int y = g_isButtonPhone ? (g_topPanelY + 22) : (g_topPanelY + 50);
-    int btnY = g_isButtonPhone ? (height - 65) : (height - 80);
-    int clipBottom = g_isButtonPhone ? (height - 30) : (height - 45);
-    int clipTop = g_isButtonPhone ? 20 : (g_topPanelY + 40);
-    
-    HRGN hClipRgn = CreateRectRgn(0, clipTop, width, clipBottom);
-    SelectClipRgn(hdc, hClipRgn);
-    
-    // Private Key секция
-    RECT rcSection = {margin, y - scrollY, width - margin, y - scrollY + sectionHeight};
-    HBRUSH sectionBrush = CreateSolidBrush(MY_COLOR_HIGHLIGHT);
-    FillRect(hdc, &rcSection, sectionBrush);
-    DeleteObject(sectionBrush);
-    
-    SetTextColor(hdc, MY_COLOR_PRIMARY_DARK);
-    RECT rcText = {margin + 5, y - scrollY, width - margin - 5, y - scrollY + sectionHeight};
-    DrawText(hdc, g_isButtonPhone ? L"Private Key" : L"Private Key (tap to edit)", 
-             -1, &rcText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    y += sectionHeight;
-    
-    // Поле ключа
-    RECT rcKey = {margin, y - scrollY, width - margin - 30, y - scrollY + keyFieldHeight};
-    HBRUSH keyBrush = CreateSolidBrush(MY_COLOR_CARD);
-    FillRect(hdc, &rcKey, keyBrush);
-    DeleteObject(keyBrush);
-    DrawFrameRect(hdc, &rcKey, g_editingKey ? RGB(0, 120, 215) : MY_COLOR_BORDER);
-    
-    if (g_isButtonPhone && g_focusIndex == 1 && g_currentTab == 0) {
-        DrawFocusIndicator(hdc, &rcKey);
-    }
-    
-    // Кнопка просмотра
-    RECT rcViewBtn = {width - margin - 25, y - scrollY, width - margin, y - scrollY + 25};
-    HBRUSH viewBrush = CreateSolidBrush(g_showFullKey ? MY_COLOR_PRIMARY : RGB(240, 240, 240));
-    FillRect(hdc, &rcViewBtn, viewBrush);
-    DeleteObject(viewBrush);
-    DrawFrameRect(hdc, &rcViewBtn, MY_COLOR_BORDER);
-    SetTextColor(hdc, g_showFullKey ? RGB(255, 255, 255) : MY_COLOR_PRIMARY);
-    DrawText(hdc, L"...", -1, &rcViewBtn, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    
-    // Текст ключа
-    SetTextColor(hdc, MY_COLOR_TEXT);
-    RECT rcKeyText = {margin + 5, y - scrollY + 2, width - margin - 35, y - scrollY + keyFieldHeight - 2};
-    
-    if (g_editingKey) {
-        WCHAR displayKey[256];
-        wsprintf(displayKey, L"%s_", g_tempKey);
-        DrawText(hdc, displayKey, -1, &rcKeyText, DT_LEFT | DT_WORDBREAK);
-        
-        // Подсказка
-        RECT rcHint = {margin + 5, y - scrollY + keyFieldHeight + 2, width - margin - 5, y - scrollY + keyFieldHeight + 20};
-        SetTextColor(hdc, RGB(0, 100, 200));
-        DrawText(hdc, L"Type new key, press Enter to save", -1, &rcHint, DT_LEFT | DT_TOP | DT_SINGLELINE);
-        
-        y += keyFieldHeight + 25;
-    } else {
-        if (g_showFullKey) {
-            WCHAR line1[65], line2[65];
-            wcsncpy(line1, g_privateKeyFull, 32); line1[32] = 0;
-            wcsncpy(line2, g_privateKeyFull + 32, 32); line2[32] = 0;
-            RECT rcLine1 = {margin + 5, y - scrollY + 2, width - margin - 35, y - scrollY + 22};
-            DrawText(hdc, line1, -1, &rcLine1, DT_LEFT | DT_TOP | DT_SINGLELINE);
-            RECT rcLine2 = {margin + 5, y - scrollY + 22, width - margin - 35, y - scrollY + 42};
-            DrawText(hdc, line2, -1, &rcLine2, DT_LEFT | DT_TOP | DT_SINGLELINE);
+    extern WCHAR g_dnsServers[8][64];
+    extern int   g_dnsCount;
+    extern BOOL  g_addingDns;
+    extern WCHAR g_newDns[64];
+    extern BOOL  g_httpProxyRunning;
+
+    int tabH    = g_isButtonPhone ? 30 : Scale(48, width);
+    int topH    = g_isButtonPhone ? 20 : (g_topPanelY + TopBarHeight(width));
+    int mx      = Scale(10, width);          // горизонтальный отступ
+    int cardMx  = mx;
+    int cardW   = width - 2 * cardMx;
+    int rowH    = Scale(40, width);          // высота строки внутри карточки
+    int hdrH    = Scale(20, width);          // высота заголовка секции
+    int btnH    = Scale(42, width);          // кнопка Start
+    int btnAreaH = btnH + Scale(12, width);  // зона кнопки Start
+
+    // Высота пункта пира/dns
+    int itemH = g_isButtonPhone ? 28 : Scale(38, width);
+
+    SetBkMode(hdc, TRANSPARENT);
+
+    // Область клипа (между шапкой и нижней панелью)
+    int clipTop    = topH;
+    int clipBottom = height - tabH - btnAreaH;
+    HRGN clipRgn = CreateRectRgn(0, clipTop, width, height - tabH);
+    SelectClipRgn(hdc, clipRgn);
+
+    int y = topH + Scale(8, width); // начальная позиция с отступом
+
+    // ── Private Key ──────────────────────────────────────────────────
+    y = DrawSectionHeader(hdc, cardMx + 4, width - cardMx, y, scrollY, L"PRIVATE KEY", hdrH);
+
+    {
+        // 1. Сначала измеряем шрифт чтобы знать высоту строки
+        SIZE charSz = { 8, 14 };
+        GetTextExtentPoint32(hdc, L"0", 1, &charSz);
+        int lineH = charSz.cy + 2;
+        if (lineH < 12) lineH = 12;
+
+        // 2. Фиксируем 4 строки — карточка всегда одного размера
+        const int KEY_LINES = 4;
+        int cardH = KEY_LINES * lineH + Scale(10, width); // +padding сверху/снизу
+
+        RECT rcCard = { cardMx, y - scrollY, cardMx + cardW, y - scrollY + cardH };
+        FillCard(hdc, &rcCard, C_CARD, g_editingKey ? C_PRIMARY : C_BORDER);
+
+        if (g_isButtonPhone && g_focusIndex == 1 && g_currentTab == 0)
+            DrawFocusIndicator(hdc, &rcCard);
+
+        // Текстовая область — вся карточка
+        int pad = Scale(6, width);
+        RECT rcKT = { rcCard.left + pad, rcCard.top + pad,
+                      rcCard.right - pad, rcCard.bottom - pad };
+        int textAreaW = rcKT.right - rcKT.left;
+
+        // Символов в строке
+        int charsPerLine = (charSz.cx > 0) ? (textAreaW / charSz.cx) : 24;
+        if (charsPerLine < 4)  charsPerLine = 4;
+        if (charsPerLine > 64) charsPerLine = 64;
+
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, g_editingKey ? C_TEXT : (g_showFullKey ? C_TEXT : C_TEXT_LIGHT));
+
+        if (g_editingKey) {
+            // Показываем последние KEY_LINES строки + курсор '|'
+            int len   = wcslen(g_tempKey);
+            int total = KEY_LINES * charsPerLine;
+            int start = (len > total - 1) ? len - (total - 1) : 0;
+
+            WCHAR src[260];
+            int si = 0;
+            int ki = start;
+            while (ki < len && si < 258) src[si++] = g_tempKey[ki++];
+            src[si++] = L'|';
+            src[si]   = 0;
+
+            int ry = rcKT.top, pos = 0, slen = si;
+            while (pos < slen && ry < rcKT.bottom) {
+                int n = slen - pos;
+                if (n > charsPerLine) n = charsPerLine;
+                RECT rl = { rcKT.left, ry, rcKT.right, ry + lineH };
+                DrawText(hdc, src + pos, n, &rl, DT_LEFT | DT_TOP | DT_SINGLELINE);
+                ry += lineH; pos += n;
+            }
+        } else if (g_showFullKey) {
+            // Полный ключ, 4 строки
+            int len = wcslen(g_privateKeyFull);
+            int ry = rcKT.top, pos = 0;
+            while (pos < len && ry < rcKT.bottom) {
+                int n = len - pos;
+                if (n > charsPerLine) n = charsPerLine;
+                RECT rl = { rcKT.left, ry, rcKT.right, ry + lineH };
+                DrawText(hdc, g_privateKeyFull + pos, n, &rl, DT_LEFT | DT_TOP | DT_SINGLELINE);
+                ry += lineH; pos += n;
+            }
         } else {
-            DrawText(hdc, g_privateKeyShort, -1, &rcKeyText, DT_LEFT | DT_WORDBREAK);
-        }
-        y += keyFieldHeight + 10;
-    }
-    
-    // Peers секция
-    RECT rcPeers = {margin, y - scrollY, width - margin, y - scrollY + sectionHeight};
-    sectionBrush = CreateSolidBrush(MY_COLOR_HIGHLIGHT);
-    FillRect(hdc, &rcPeers, sectionBrush);
-    DeleteObject(sectionBrush);
-    
-    SetTextColor(hdc, MY_COLOR_PRIMARY_DARK);
-    RECT rcPeersText = {margin + 5, y - scrollY, width - margin - 35, y - scrollY + sectionHeight};
-    DrawText(hdc, L"Peers", -1, &rcPeersText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    
-    RECT rcAddPeer = {width - margin - 25, y - scrollY, width - margin, y - scrollY + 22};
-    HBRUSH addBrush = CreateSolidBrush(g_addingPeer ? MY_COLOR_SUCCESS : RGB(220, 220, 220));
-    FillRect(hdc, &rcAddPeer, addBrush);
-    DeleteObject(addBrush);
-    DrawFrameRect(hdc, &rcAddPeer, MY_COLOR_BORDER);
-    
-    if (g_isButtonPhone && g_focusIndex == 2 && g_currentTab == 0) {
-        DrawFocusIndicator(hdc, &rcAddPeer);
-    }
-    
-    SetTextColor(hdc, MY_COLOR_TEXT);
-    DrawText(hdc, L"+", -1, &rcAddPeer, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    y += sectionHeight;
-    
-    // Поле ввода нового пира
-    if (g_addingPeer) {
-        RECT rcNewPeer = {margin, y - scrollY, width - margin, y - scrollY + 25};
-        HBRUSH peerBrush = CreateSolidBrush(MY_COLOR_CARD);
-        FillRect(hdc, &rcNewPeer, peerBrush);
-        DeleteObject(peerBrush);
-        DrawFrameRect(hdc, &rcNewPeer, MY_COLOR_SUCCESS);
-        
-        WCHAR displayPeer[128];
-        wsprintf(displayPeer, L"%s_", g_newPeer);
-        SetTextColor(hdc, MY_COLOR_TEXT);
-        RECT rcPeerText = {margin + 5, y - scrollY, width - margin - 5, y - scrollY + 20};
-        DrawText(hdc, displayPeer, -1, &rcPeerText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        
-        // Подсказка
-        RECT rcHint = {margin + 5, y - scrollY + 27, width - margin - 5, y - scrollY + 45};
-        SetTextColor(hdc, RGB(0, 100, 0));
-        DrawText(hdc, L"Type address, Enter to add", -1, &rcHint, DT_LEFT | DT_TOP);
-        
-        y += 55;
-    }
-    
-    // Список пиров
-    for (int i = 0; i < g_peerCount; i++) {
-        BOOL isSelected = (i == g_selectedPeer);
-        RECT rcPeer = {margin, y - scrollY, width - margin - 25, y - scrollY + peerItemHeight};
-        
-        if (isSelected) {
-            HBRUSH selBrush = CreateSolidBrush(MY_COLOR_HIGHLIGHT);
-            RECT rcSel = {margin - 5, y - scrollY - 1, width - margin - 20, y - scrollY + peerItemHeight - 1};
-            FillRect(hdc, &rcSel, selBrush);
-            DeleteObject(selBrush);
-        }
-        
-        SetTextColor(hdc, isSelected ? MY_COLOR_PRIMARY_DARK : MY_COLOR_TEXT);
-        RECT rcPeerText = {margin + 5, y - scrollY, width - margin - 35, y - scrollY + peerItemHeight};
-        DrawText(hdc, g_peersList[i], -1, &rcPeerText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        
-        RECT rcDelete = {width - margin - 20, y - scrollY, width - margin - 5, y - scrollY + 18};
-        HBRUSH delBrush = CreateSolidBrush(RGB(255, 200, 200));
-        FillRect(hdc, &rcDelete, delBrush);
-        DeleteObject(delBrush);
-        DrawFrameRect(hdc, &rcDelete, RGB(200, 0, 0));
-        
-        if (g_isButtonPhone && g_focusIndex == (3 + i) && g_currentTab == 0) {
-            DrawFocusIndicator(hdc, &rcDelete);
-        }
-        
-        SetTextColor(hdc, RGB(200, 0, 0));
-        DrawText(hdc, L"X", -1, &rcDelete, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        
-        y += peerItemHeight;
-    }
-    
-    // Обновляем максимальный индекс фокуса (+1 для HTTP Proxy кнопки)
-    if (g_currentTab == 0) {
-        extern int g_maxFocusIndex;
-        g_maxFocusIndex = 3 + g_peerCount;
-    } else if (g_currentTab == 1) {
-        extern int g_maxFocusIndex;
-        g_maxFocusIndex = 1; // On/Off и Clear
-    }
-    
-    // HTTP Proxy кнопка (для Opera)
-    RECT rcHttpProxyBtn = {margin, y - scrollY, width - margin, y - scrollY + 25};
-    extern BOOL g_httpProxyRunning;
-    extern HANDLE g_hHttpProxyThread;
-    HBRUSH httpBrush = CreateSolidBrush(g_httpProxyRunning ? RGB(40, 200, 100) : RGB(255, 255, 255));
-    FillRect(hdc, &rcHttpProxyBtn, httpBrush);
-    DeleteObject(httpBrush);
-    
-    // Рамка фокуса для кнопочных телефонов (рисуем поверх)
-    if (g_isButtonPhone && g_focusIndex == (3 + g_peerCount) && g_currentTab == 0) {
-        HPEN hPen = CreatePen(PS_SOLID, 3, RGB(255, 0, 0));
-        HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
-        HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        Rectangle(hdc, rcHttpProxyBtn.left - 2, rcHttpProxyBtn.top - 2, 
-                       rcHttpProxyBtn.right + 2, rcHttpProxyBtn.bottom + 2);
-        SelectObject(hdc, hOldPen);
-        SelectObject(hdc, hOldBrush);
-        DeleteObject(hPen);
-    }
-    
-    DrawFrameRect(hdc, &rcHttpProxyBtn, g_httpProxyRunning ? RGB(0, 150, 0) : RGB(200, 200, 200));
-    
-    SetTextColor(hdc, g_httpProxyRunning ? RGB(255, 255, 255) : RGB(30, 30, 30));
-    WCHAR httpText[64];
-    wsprintf(httpText, L"HTTP Proxy: %s", g_httpProxyRunning ? L"ON (127.0.0.1:8080)" : L"OFF");
-    DrawText(hdc, httpText, -1, &rcHttpProxyBtn, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    y += 30;
-    
-    // IP секция
-    RECT rcIPSection = {margin, y - scrollY, width - margin, y - scrollY + sectionHeight};
-    sectionBrush = CreateSolidBrush(MY_COLOR_HIGHLIGHT);
-    FillRect(hdc, &rcIPSection, sectionBrush);
-    DeleteObject(sectionBrush);
-    
-    SetTextColor(hdc, MY_COLOR_PRIMARY_DARK);
-    RECT rcIPSectionText = {margin + 5, y - scrollY, width - margin - 5, y - scrollY + sectionHeight};
-    DrawText(hdc, L"Your Yggdrasil IP", -1, &rcIPSectionText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    y += sectionHeight;
-    
-    RECT rcIP = {margin, y - scrollY, width - margin, y - scrollY + 50};
-    HBRUSH ipBrush = CreateSolidBrush(MY_COLOR_CARD);
-    FillRect(hdc, &rcIP, ipBrush);
-    DeleteObject(ipBrush);
-    DrawFrameRect(hdc, &rcIP, g_serviceRunning ? MY_COLOR_SUCCESS : MY_COLOR_BORDER);
-    
-    SetTextColor(hdc, g_serviceRunning ? MY_COLOR_SUCCESS : MY_COLOR_WARNING);
-    
-    if (g_serviceRunning) {
-        // Разбиваем IP на две строки
-        WCHAR ipPart1[24] = L"";
-        WCHAR ipPart2[24] = L"";
-        int ipLen = wcslen(g_currentIP);
-        
-        int colonCount = 0;
-        int splitPos = ipLen / 2;
-        for (int i = 0; i < ipLen; i++) {
-            if (g_currentIP[i] == L':') {
-                colonCount++;
-                if (colonCount == 4) {
-                    splitPos = i;
-                    break;
+            // Маскировка — символ U+25CF (● Black Circle) из Tahoma
+            {
+                // Измеряем реальную ширину кружка — он шире обычного символа
+                WCHAR dot[2] = { 0x25CF, 0 };
+                SIZE dotSz = { charSz.cx, charSz.cy };
+                GetTextExtentPoint32(hdc, dot, 1, &dotSz);
+                int circlesPerLine = (dotSz.cx > 0) ? (textAreaW / dotSz.cx) : charsPerLine;
+                if (circlesPerLine < 2)  circlesPerLine = 2;
+                if (circlesPerLine > 68) circlesPerLine = 68;
+
+                SetTextColor(hdc, C_TEXT);
+                WCHAR circles[70];
+                int ci;
+                for (ci = 0; ci < circlesPerLine; ci++) circles[ci] = 0x25CF;
+                circles[ci] = 0;
+                int ry = rcKT.top;
+                while (ry + lineH <= rcKT.bottom + 1) {
+                    RECT rl = { rcKT.left, ry, rcKT.right, ry + lineH };
+                    DrawText(hdc, circles, -1, &rl, DT_LEFT | DT_TOP | DT_SINGLELINE);
+                    ry += lineH;
                 }
             }
         }
-        
-        wcsncpy(ipPart1, g_currentIP, splitPos);
-        ipPart1[splitPos] = 0;
-        if (splitPos < ipLen - 1) {
-            wcscpy(ipPart2, g_currentIP + splitPos + 1);
+
+        y += cardH + Scale(12, width);
+    }
+
+    // ── Peers ─────────────────────────────────────────────────────────
+    y = DrawSectionHeader(hdc, cardMx + 4, width - cardMx, y, scrollY, L"PEERS", hdrH);
+
+    {
+        // Строки пиров + строка добавления
+        int linesCount = g_peerCount + (g_addingPeer ? 1 : 0) + 1; // +1 = кнопка Add
+        int cardH = linesCount * itemH;
+        RECT rcCard = { cardMx, y - scrollY, cardMx + cardW, y - scrollY + cardH };
+        FillCard(hdc, &rcCard, C_CARD, C_BORDER);
+
+        int iy = y;
+
+        // Существующие пиры
+        for (int i = 0; i < g_peerCount; i++) {
+            RECT rcRow = { cardMx, iy - scrollY, cardMx + cardW, iy - scrollY + itemH };
+            if (i < g_peerCount - 1 || g_addingPeer)
+                DrawDivider(hdc, cardMx + Scale(8,width), cardMx + cardW - Scale(8,width),
+                            iy - scrollY + itemH - 1, C_BORDER);
+
+            int delW = Scale(32, width);
+            RECT rcDel = { rcRow.right - delW - 4, rcRow.top + (itemH - Scale(24,width))/2,
+                           rcRow.right - 4, rcRow.top + (itemH + Scale(24,width))/2 };
+            DrawDeleteBtn(hdc, &rcDel);
+
+            if (g_isButtonPhone && g_focusIndex == (2 + i) && g_currentTab == 0)
+                DrawFocusIndicator(hdc, &rcDel);
+
+            SetTextColor(hdc, C_TEXT);
+            RECT rcT = { rcRow.left + Scale(8,width), rcRow.top,
+                         rcDel.left - 4, rcRow.bottom };
+            DrawText(hdc, g_peersList[i], -1, &rcT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            iy += itemH;
         }
-        
-        RECT rcIP1 = {margin + 5, y - scrollY + 2, width - margin - 5, y - scrollY + 25};
-        DrawText(hdc, ipPart1, -1, &rcIP1, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        
-        RECT rcIP2 = {margin + 5, y - scrollY + 25, width - margin - 5, y - scrollY + 48};
-        DrawText(hdc, ipPart2, -1, &rcIP2, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    } else {
-        DrawText(hdc, L"Not connected", -1, &rcIP, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        // Поле ввода нового пира
+        if (g_addingPeer) {
+            RECT rcRow = { cardMx, iy - scrollY, cardMx + cardW, iy - scrollY + itemH };
+            DrawDivider(hdc, cardMx + Scale(8,width), cardMx + cardW - Scale(8,width),
+                        iy - scrollY + itemH - 1, C_BORDER);
+            RECT rcIn = { rcRow.left + Scale(8,width), rcRow.top + 4,
+                          rcRow.right - Scale(8,width), rcRow.bottom - 4 };
+            FillRoundCard(hdc, &rcIn, RGB(240,245,255), C_PRIMARY);
+            WCHAR d[130]; wsprintf(d, L"%s_", g_newPeer);
+            SetTextColor(hdc, C_TEXT);
+            RECT rcIT = { rcIn.left + 4, rcIn.top, rcIn.right - 4, rcIn.bottom };
+            DrawText(hdc, d, -1, &rcIT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            iy += itemH;
+        }
+
+        // Строка «Добавить пир»
+        {
+            RECT rcAdd = { cardMx, iy - scrollY, cardMx + cardW, iy - scrollY + itemH };
+            if (g_addingPeer) {
+                HBRUSH ab = CreateSolidBrush(RGB(230,245,255));
+                FillRect(hdc, &rcAdd, ab); DeleteObject(ab);
+            }
+            if (g_isButtonPhone && g_focusIndex == (2 + g_peerCount) && g_currentTab == 0)
+                DrawFocusIndicator(hdc, &rcAdd);
+            SetTextColor(hdc, C_PRIMARY);
+            LPCWSTR lbl = g_addingPeer ? L"-  Enter peer URI..." : L"+  Add peer";
+            RECT rcT = { rcAdd.left + Scale(8,width), rcAdd.top,
+                         rcAdd.right - Scale(8,width), rcAdd.bottom };
+            DrawText(hdc, lbl, -1, &rcT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
+
+        y += cardH + Scale(12, width);
     }
-    y += 55;
-    
+
+    // ── Your Yggdrasil IP ─────────────────────────────────────────────
+    y = DrawSectionHeader(hdc, cardMx + 4, width - cardMx, y, scrollY, L"YOUR YGGDRASIL IP", hdrH);
+
+    {
+        // Измеряем шрифт для адаптивного переноса
+        SIZE ipCharSz = { 8, 14 };
+        GetTextExtentPoint32(hdc, L"0", 1, &ipCharSz);
+        int ipLineH = ipCharSz.cy + 2;
+        if (ipLineH < 12) ipLineH = 12;
+
+        int pad = Scale(8, width);
+        int textW = cardW - 2 * pad;
+        int ipCharsPerLine = (ipCharSz.cx > 0) ? (textW / ipCharSz.cx) : 20;
+        if (ipCharsPerLine < 4) ipCharsPerLine = 4;
+
+        // Высота карточки — по количеству строк IP (минимум 1)
+        int ipLen = g_serviceRunning ? (int)wcslen(g_currentIP) : 0;
+        int ipLines = g_serviceRunning ? ((ipLen + ipCharsPerLine - 1) / ipCharsPerLine) : 1;
+        if (ipLines < 1) ipLines = 1;
+        int cardH = ipLines * ipLineH + 2 * pad;
+        if (cardH < Scale(40, width)) cardH = Scale(40, width); // минимум
+
+        RECT rcCard = { cardMx, y - scrollY, cardMx + cardW, y - scrollY + cardH };
+        COLORREF borderColor = g_serviceRunning ? C_SUCCESS : C_BORDER;
+        FillCard(hdc, &rcCard, C_CARD, borderColor);
+
+        if (g_serviceRunning) {
+            // Адаптивный перенос — построчно, зелёным цветом
+            SetTextColor(hdc, C_SUCCESS);
+            SetBkMode(hdc, TRANSPARENT);
+            int ry = rcCard.top + pad, pos = 0;
+            while (pos < ipLen && ry < rcCard.bottom - pad + 1) {
+                int n = ipLen - pos;
+                if (n > ipCharsPerLine) n = ipCharsPerLine;
+                RECT rl = { rcCard.left + pad, ry, rcCard.right - pad, ry + ipLineH };
+                DrawText(hdc, g_currentIP + pos, n, &rl, DT_LEFT | DT_TOP | DT_SINGLELINE);
+                ry += ipLineH; pos += n;
+            }
+        } else {
+            SetTextColor(hdc, C_TEXT_LIGHT);
+            DrawText(hdc, L"Not connected", -1, &rcCard, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        y += cardH + Scale(12, width);
+    }
+
+    // ── Proxy Configuration ───────────────────────────────────────────
+    y = DrawSectionHeader(hdc, cardMx + 4, width - cardMx, y, scrollY, L"PROXY CONFIGURATION", hdrH);
+
+    {
+        int cardH = rowH;
+        RECT rcCard = { cardMx, y - scrollY, cardMx + cardW, y - scrollY + cardH };
+        FillCard(hdc, &rcCard, C_CARD, C_BORDER);
+
+        if (g_isButtonPhone && g_focusIndex == (3 + g_peerCount) && g_currentTab == 0)
+            DrawFocusIndicator(hdc, &rcCard); // HTTP Proxy = 3+n
+
+        SetTextColor(hdc, C_TEXT);
+        RECT rcL = { rcCard.left + Scale(8,width), rcCard.top,
+                     rcCard.right - Scale(52,width), rcCard.bottom };
+        DrawText(hdc, L"HTTP Proxy  127.0.0.1:8080", -1, &rcL, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        // Toggle
+        int tgW = Scale(44, width), tgH = Scale(22, width);
+        RECT rcTg = { rcCard.right - tgW - Scale(8,width),
+                      rcCard.top + (rowH - tgH)/2,
+                      rcCard.right - Scale(8,width),
+                      rcCard.top + (rowH + tgH)/2 };
+        DrawToggle(hdc, &rcTg, g_httpProxyRunning);
+        y += cardH + Scale(12, width);
+    }
+
+    // ── DNS Servers ───────────────────────────────────────────────────
+    y = DrawSectionHeader(hdc, cardMx + 4, width - cardMx, y, scrollY, L"DNS SERVERS", hdrH);
+
+    {
+        int linesCount = g_dnsCount + (g_addingDns ? 1 : 0) + 1;
+        int cardH = linesCount * itemH;
+        RECT rcCard = { cardMx, y - scrollY, cardMx + cardW, y - scrollY + cardH };
+        FillCard(hdc, &rcCard, C_CARD, C_BORDER);
+
+        int iy = y;
+        for (int i = 0; i < g_dnsCount; i++) {
+            RECT rcRow = { cardMx, iy - scrollY, cardMx + cardW, iy - scrollY + itemH };
+            if (i < g_dnsCount - 1 || g_addingDns)
+                DrawDivider(hdc, cardMx + Scale(8,width), cardMx + cardW - Scale(8,width),
+                            iy - scrollY + itemH - 1, C_BORDER);
+
+            int delW = Scale(32, width);
+            RECT rcDel = { rcRow.right - delW - 4, rcRow.top + (itemH - Scale(24,width))/2,
+                           rcRow.right - 4, rcRow.top + (itemH + Scale(24,width))/2 };
+            DrawDeleteBtn(hdc, &rcDel);
+
+            int dnsFocusBase = 4 + g_peerCount; // 0=Start,1=Key,2..2+n-1=DelPeer,2+n=AddPeer,3+n=Proxy,4+n..=DelDNS,4+n+m=AddDNS
+            if (g_isButtonPhone && g_focusIndex == (dnsFocusBase + i) && g_currentTab == 0)
+                DrawFocusIndicator(hdc, &rcDel);
+
+            // Пометка «primary» для первого — измеряем реальную ширину
+            int tagW = 0;
+            if (i == 0) {
+                SIZE tagSz = { 0, 0 };
+                GetTextExtentPoint32(hdc, L"primary", 7, &tagSz);
+                tagW = tagSz.cx + Scale(6, width);
+                SetTextColor(hdc, C_TEXT_LIGHT);
+                RECT rcTag = { rcDel.left - tagW - 4, rcRow.top, rcDel.left - 4, rcRow.bottom };
+                DrawText(hdc, L"primary", -1, &rcTag, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            }
+
+            SetTextColor(hdc, i == 0 ? C_TEXT : C_TEXT_LIGHT);
+            RECT rcT = { rcRow.left + Scale(8,width), rcRow.top,
+                         rcDel.left - (i == 0 ? tagW + 4 : 4),
+                         rcRow.bottom };
+            DrawText(hdc, g_dnsServers[i], -1, &rcT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            iy += itemH;
+        }
+
+        // Поле ввода нового DNS
+        if (g_addingDns) {
+            RECT rcRow = { cardMx, iy - scrollY, cardMx + cardW, iy - scrollY + itemH };
+            DrawDivider(hdc, cardMx + Scale(8,width), cardMx + cardW - Scale(8,width),
+                        iy - scrollY + itemH - 1, C_BORDER);
+            RECT rcIn = { rcRow.left + Scale(8,width), rcRow.top + 4,
+                          rcRow.right - Scale(8,width), rcRow.bottom - 4 };
+            FillRoundCard(hdc, &rcIn, RGB(240,245,255), C_PRIMARY);
+            WCHAR d[70]; wsprintf(d, L"%s_", g_newDns);
+            SetTextColor(hdc, C_TEXT);
+            RECT rcIT = { rcIn.left + 4, rcIn.top, rcIn.right - 4, rcIn.bottom };
+            DrawText(hdc, d, -1, &rcIT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            iy += itemH;
+        }
+
+        // Строка «Добавить DNS»
+        {
+            RECT rcAdd = { cardMx, iy - scrollY, cardMx + cardW, iy - scrollY + itemH };
+            if (g_addingDns) {
+                HBRUSH ab = CreateSolidBrush(RGB(230,245,255));
+                FillRect(hdc, &rcAdd, ab); DeleteObject(ab);
+            }
+            if (g_isButtonPhone && g_focusIndex == (4 + g_peerCount + g_dnsCount) && g_currentTab == 0)
+                DrawFocusIndicator(hdc, &rcAdd);
+            SetTextColor(hdc, C_PRIMARY);
+            LPCWSTR lbl = g_addingDns ? L"-  Enter DNS address..." : L"+  Add DNS server";
+            RECT rcT = { rcAdd.left + Scale(8,width), rcAdd.top,
+                         rcAdd.right - Scale(8,width), rcAdd.bottom };
+            DrawText(hdc, lbl, -1, &rcT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        }
+
+        y += cardH + Scale(12, width);
+    }
+
     SelectClipRgn(hdc, NULL);
-    DeleteObject(hClipRgn);
-    
-    // Спиннер и кнопка Start/Stop
+    DeleteObject(clipRgn);
+
+    // Обновляем g_maxFocusIndex
+    if (g_currentTab == 0) {
+        extern int g_maxFocusIndex;
+        // 0=Start, 1=Key, 2..2+n-1=DelPeer, 2+n=AddPeer,
+        // 3+n=Proxy, 4+n..4+n+m-1=DelDNS, 4+n+m=AddDNS
+        g_maxFocusIndex = 4 + g_peerCount + g_dnsCount;
+    }
+
+    // ── Кнопка Start / Stop (фиксированно над нижней панелью) ─────────
+    {
+        int bH  = btnH;
+        int by  = height - tabH - bH - Scale(8, width);
+        RECT rcBtn = { mx, by, width - mx, by + bH };
+        COLORREF bc  = g_serviceRunning ? C_SUCCESS : (g_connecting ? C_WARNING : C_PRIMARY);
+        COLORREF brc = g_serviceRunning ? RGB(30,150,70) : (g_connecting ? RGB(180,110,0) : C_PRIMARY_DARK);
+        HPEN   bpen = CreatePen(PS_SOLID, 1, brc);
+        HBRUSH bb   = CreateSolidBrush(bc);
+        HGDIOBJ obp = SelectObject(hdc, bpen);
+        HGDIOBJ obb = SelectObject(hdc, bb);
+        RoundRect(hdc, rcBtn.left, rcBtn.top, rcBtn.right, rcBtn.bottom, CARD_RADIUS*2, CARD_RADIUS*2);
+        SelectObject(hdc, obp); SelectObject(hdc, obb);
+        DeleteObject(bpen); DeleteObject(bb);
+        if (g_isButtonPhone && g_focusIndex == 0 && g_currentTab == 0)
+            DrawFocusIndicator(hdc, &rcBtn);
+        SetTextColor(hdc, RGB(255,255,255));
+        LPCWSTR btnTxt = g_serviceRunning ? L"Stop Service" :
+                         (g_connecting ? L"Connecting..." : L"Start Service");
+        DrawText(hdc, btnTxt, -1, &rcBtn, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    // Прогресс-бар при подключении
     if (g_showSpinner && g_connecting) {
-        int barY = btnY - 15;
-        int barWidth = width - 60;
-        int barX = 30;
-        int barHeight = 8;
-        
-        RECT rcBarBg = {barX, barY, barX + barWidth, barY + barHeight};
-        HBRUSH barBgBrush = CreateSolidBrush(RGB(220, 220, 220));
-        FillRect(hdc, &rcBarBg, barBgBrush);
-        DeleteObject(barBgBrush);
-        
-        int blockWidth = barWidth / 5;
-        int blockPos = (g_spinnerAngle * (barWidth - blockWidth)) / 360;
-        
-        RECT rcBarFill = {barX + blockPos, barY, barX + blockPos + blockWidth, barY + barHeight};
-        HBRUSH barFillBrush = CreateSolidBrush(MY_COLOR_PRIMARY);
-        FillRect(hdc, &rcBarFill, barFillBrush);
-        DeleteObject(barFillBrush);
+        int by = height - tabH - btnH - Scale(8,width) - Scale(12,width);
+        int bw = width - 2*mx;
+        RECT rcBg = { mx, by, mx + bw, by + Scale(4,width) };
+        HBRUSH bgBr = CreateSolidBrush(C_BORDER);
+        FillRect(hdc, &rcBg, bgBr); DeleteObject(bgBr);
+        int bk = bw / 5;
+        int bp = (g_spinnerAngle * (bw - bk)) / 360;
+        RECT rcFl = { mx + bp, by, mx + bp + bk, by + Scale(4,width) };
+        HBRUSH flBr = CreateSolidBrush(C_PRIMARY);
+        FillRect(hdc, &rcFl, flBr); DeleteObject(flBr);
     }
-    
-    RECT rcButton = {20, btnY, width - 20, btnY + 35};
-    COLORREF btnColor = g_serviceRunning ? MY_COLOR_SUCCESS :
-        (g_connecting ? RGB(255, 170, 0) : MY_COLOR_PRIMARY);
-    HBRUSH btnBrush = CreateSolidBrush(btnColor);
-    FillRect(hdc, &rcButton, btnBrush);
-    DeleteObject(btnBrush);
-    DrawFrameRect(hdc, &rcButton, MY_COLOR_PRIMARY_DARK);
-    
-    if (g_isButtonPhone && g_focusIndex == 0 && g_currentTab == 0) {
-        DrawFocusIndicator(hdc, &rcButton);
-    }
-    
-    SetTextColor(hdc, RGB(255, 255, 255));
-    LPCWSTR btnText = g_serviceRunning ? L"Stop Service" :
-        (g_connecting ? L"Connecting..." : L"Start Service");
-    DrawText(hdc, btnText, -1, &rcButton, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    
-    g_totalHeight = y + 20;
-    int visibleHeight = g_isButtonPhone ? (height - 50) : (height - (g_topPanelY + 40 + 45));
-    int maxScroll = max(0, g_totalHeight - visibleHeight);
-    Scroll_SetBounds(&g_scroll, 0, 0, 0, maxScroll);
+
+    // Контент стартует с topH + Scale(8), видимая область = height - tabH - topH - btnAreaH
+    int contentH = y - topH + Scale(8, width);
+    int visH = height - tabH - topH - btnAreaH;
+    int maxSc = (contentH > visH) ? contentH - visH : 0;
+    Scroll_SetBounds(&g_scroll, 0, 0, 0, maxSc);
 }
+
+// ============================================================================
+// Logs вкладка
+// ============================================================================
 
 void DrawLogsTab(HDC hdc, int width, int height, int scrollY) {
-    // Устанавливаем максимальный индекс фокуса для кнопочных телефонов
-    if (g_isButtonPhone) {
-        extern int g_maxFocusIndex;
-        g_maxFocusIndex = 1; // On/Off (0) и Clear (1)
-    }
-    
-    int lineHeight = (height >= 640) ? 34 : ((height >= 480) ? 28 : ((height <= 240) ? 16 : 20));
-    int panelHeight = (height >= 640) ? 55 : ((height >= 480) ? 50 : 45);
-    int margin = (width >= 640) ? 15 : ((width >= 480) ? 12 : 8);
-    int btnHeight = (height >= 640) ? 32 : 25;
-    
-    int panelY = g_isButtonPhone ? (g_topPanelY + 22) : (g_topPanelY + 45);
-    int panelBottom = panelY + btnHeight + 5;
-    
-    // Кнопка On/Off (левее Clear)
-    RECT rcToggle = {width - margin - 120, panelY, width - margin - 65, panelY + btnHeight};
+    if (g_isButtonPhone) { extern int g_maxFocusIndex; g_maxFocusIndex = 1; }
+
+    int tabH   = g_isButtonPhone ? 30 : Scale(48, width);
+    int topH   = g_isButtonPhone ? 20 : (g_topPanelY + TopBarHeight(width));
+    int mx     = Scale(8, width);
+    int btnH   = Scale(28, width);
+
+    // Измеряем реальную высоту шрифта
+    SIZE charSz = { 8, 14 };
+    GetTextExtentPoint32(hdc, L"Ag", 2, &charSz);
+    int lineH = charSz.cy + 4; // +4px межстрочный интервал
+    if (lineH < 16) lineH = 16;
+
+    // Панель управления логами
+    int panY = topH + Scale(6, width);
+    RECT rcPanel = { mx, panY, width - mx, panY + btnH };
+    SetBkMode(hdc, TRANSPARENT);
+
+    // Счётчик
+    WCHAR stats[32]; wsprintf(stats, L"%d entries", g_logCount);
+    SetTextColor(hdc, C_TEXT_LIGHT);
+    RECT rcSt = { rcPanel.left, rcPanel.top, rcPanel.right - Scale(130,width), rcPanel.bottom };
+    DrawText(hdc, stats, -1, &rcSt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    // Кнопка On/Off
     extern BOOL g_logsEnabled;
-    HBRUSH toggleBrush = CreateSolidBrush(g_logsEnabled ? RGB(200, 255, 200) : RGB(255, 200, 200));
-    FillRect(hdc, &rcToggle, toggleBrush);
-    DeleteObject(toggleBrush);
-    DrawFrameRect(hdc, &rcToggle, MY_COLOR_BORDER);
-    SetTextColor(hdc, MY_COLOR_TEXT);
-    DrawText(hdc, g_logsEnabled ? L"On" : L"Off", -1, &rcToggle, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    
+    RECT rcOn = { width - mx - Scale(120,width), panY, width - mx - Scale(62,width), panY + btnH };
+    COLORREF onC = g_logsEnabled ? C_SUCCESS : C_DANGER;
+    HBRUSH onBr = CreateSolidBrush(onC);
+    FillRect(hdc, &rcOn, onBr); DeleteObject(onBr);
+    SetTextColor(hdc, RGB(255,255,255));
+    DrawText(hdc, g_logsEnabled ? L"ON" : L"OFF", -1, &rcOn, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if (g_isButtonPhone && g_focusIndex == 0) DrawFocusIndicator(hdc, &rcOn);
+
     // Кнопка Clear
-    RECT rcClear = {width - margin - 60, panelY, width - margin, panelY + btnHeight};
-    HBRUSH clearBrush = CreateSolidBrush(RGB(240, 240, 240));
-    FillRect(hdc, &rcClear, clearBrush);
-    DeleteObject(clearBrush);
-    DrawFrameRect(hdc, &rcClear, MY_COLOR_BORDER);
-    SetTextColor(hdc, MY_COLOR_TEXT);
-    DrawText(hdc, L"Clear", -1, &rcClear, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    
-    // Индикатор фокуса для кнопочных телефонов
-    if (g_isButtonPhone && g_currentTab == 1) {
-        if (g_focusIndex == 0) {
-            DrawFocusIndicator(hdc, &rcToggle);  // On/Off
-        } else if (g_focusIndex == 1) {
-            DrawFocusIndicator(hdc, &rcClear);   // Clear
-        }
-    }
-    
-    WCHAR stats[64];
-    wsprintf(stats, L"Log entries: %d", g_logCount);
-    RECT rcStats = {margin, panelY, width - margin - 70, panelY + btnHeight};
-    SetTextColor(hdc, MY_COLOR_TEXT_LIGHT);
-    DrawText(hdc, stats, -1, &rcStats, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    
-    HPEN pen = CreatePen(PS_SOLID, 1, MY_COLOR_BORDER);
-    HGDIOBJ oldPen = SelectObject(hdc, pen);
-    MoveToEx(hdc, margin, panelBottom, NULL);
-    LineTo(hdc, width - margin, panelBottom);
-    SelectObject(hdc, oldPen);
-    DeleteObject(pen);
-    
-    int clipBottom = g_isButtonPhone ? (height - 30) : (height - panelHeight);
-    HRGN hClipRgn = CreateRectRgn(0, panelBottom + 5, width, clipBottom);
-    SelectClipRgn(hdc, hClipRgn);
-    
-    int y = panelBottom + 10;
-    int index = g_logTail;
+    RECT rcCl = { width - mx - Scale(56,width), panY, width - mx, panY + btnH };
+    HBRUSH clBr = CreateSolidBrush(C_BORDER);
+    FillRect(hdc, &rcCl, clBr); DeleteObject(clBr);
+    DrawFrameRect(hdc, &rcCl, C_BORDER);
+    SetTextColor(hdc, C_TEXT);
+    DrawText(hdc, L"Clear", -1, &rcCl, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if (g_isButtonPhone && g_focusIndex == 1) DrawFocusIndicator(hdc, &rcCl);
+
+    DrawDivider(hdc, mx, width - mx, panY + btnH + Scale(4,width), C_BORDER);
+
+    int clipTop    = panY + btnH + Scale(6,width);
+    int clipBottom = height - tabH;
+    HRGN clipRgn = CreateRectRgn(0, clipTop, width, clipBottom);
+    SelectClipRgn(hdc, clipRgn);
+
+    // Логи в обратном порядке: последний сверху
+    // g_logHead указывает на следующую позицию записи (самую новую - 1)
+    int y = clipTop;
     for (int i = 0; i < g_logCount; i++) {
-        LogEntry* entry = &g_logBuffer[index];
-        if (entry->text[0] == 0) {
-            index = (index + 1) % LOG_BUFFER_SIZE;
-            continue;
+        // Идём от последней записи к первой
+        int index = ((g_logHead - 1 - i) % LOG_BUFFER_SIZE + LOG_BUFFER_SIZE) % LOG_BUFFER_SIZE;
+        LogEntry* e = &g_logBuffer[index];
+        if (e->text[0]) {
+            WCHAR line[256];
+            wsprintf(line, L"[%02d:%02d:%02d] %s",
+                     e->time.wHour, e->time.wMinute, e->time.wSecond, e->text);
+            int iy = y - scrollY;
+            if (iy + lineH > clipTop && iy < clipBottom) {
+                SetTextColor(hdc, GetLogColor(e->type));
+                RECT rcL = { mx, iy, width - mx, iy + lineH };
+                DrawText(hdc, line, -1, &rcL, DT_LEFT | DT_TOP | DT_SINGLELINE);
+            }
+            y += lineH;
         }
-        
-        WCHAR timeStr[16];
-        wsprintf(timeStr, L"[%02d:%02d:%02d]", 
-                 entry->time.wHour, entry->time.wMinute, entry->time.wSecond);
-        WCHAR line[256];
-        wsprintf(line, L"%s %s", timeStr, entry->text);
-        int itemY = y - scrollY;
-        
-        SetTextColor(hdc, GetLogColor(entry->type));
-        RECT rcText = {margin + 5, itemY + 2, width - margin - 5, itemY + lineHeight - 2};
-        DrawText(hdc, line, -1, &rcText, DT_LEFT | DT_TOP | DT_SINGLELINE);
-        y += lineHeight;
-        index = (index + 1) % LOG_BUFFER_SIZE;
     }
-    
+
     SelectClipRgn(hdc, NULL);
-    DeleteObject(hClipRgn);
-    
-    g_totalHeight = y + 20;
-    int visibleHeight = height - (panelBottom + 15 + panelHeight);
-    int maxScroll = max(0, g_totalHeight - visibleHeight);
-    Scroll_SetBounds(&g_scroll, 0, 0, 0, maxScroll);
+    DeleteObject(clipRgn);
+
+    // Полная высота контента (без учёта clipTop-смещения)
+    int contentH = y - clipTop + Scale(8, width);
+    int visH = clipBottom - clipTop;
+    int maxSc = (contentH > visH) ? contentH - visH : 0;
+    Scroll_SetBounds(&g_scroll, 0, 0, 0, maxSc);
 }
+
+// ============================================================================
+// Info вкладка
+// ============================================================================
 
 void DrawInfoTab(HDC hdc, int width, int height, int scrollY) {
-    int margin = (width >= 640) ? 15 : ((width >= 480) ? 12 : 8);
-    int panelHeight = (height >= 640) ? 55 : ((height >= 480) ? 50 : 45);
-    int itemHeight = (height >= 640) ? 32 : ((height <= 240) ? 18 : 22);
-    
-    int clipBottom = g_isButtonPhone ? (height - 30) : (height - panelHeight);
-    int clipTop = g_isButtonPhone ? 22 : (g_topPanelY + 40);
-    
-    HRGN hClipRgn = CreateRectRgn(0, clipTop, width, clipBottom);
-    SelectClipRgn(hdc, hClipRgn);
-    
-    int y = g_isButtonPhone ? (g_topPanelY + 22) : (g_topPanelY + 50);
-    
-    LPCWSTR infoItems[] = {
-        L"About Yggstack",
-        L"  Version 1.1",
-        L"  for Windows Mobile 5/6",
-        L"  Build: 2026.03.28",
-        L"",
-        L"Yggdrasil Network",
-        L"  IPv6 mesh networking",
-        L"  Ironwood protocol",
-        L"  End-to-end encryption",
-        L"",
-        L"Proxy",
-        L"  HTTP proxy: 127.0.0.1:8080",
-        L"  for Opera",
-        L"",
-        L"Features",
-        L"  + Fast crypto (afternm)",
-        L"  + Session reuse",
-        L"  + Pre-generated keys",
-        L"  + Smooth scrolling",
-        L"  + Hardware keyboard",
-        L"  + Touch support",
-        L"",
-        L"Links",
-        L"  yggdrasil-network.github.io",
-        L"  github.com/tribetmen",
-        L"",
-        L"(c) 2026 tribetmen"
+    int tabH  = g_isButtonPhone ? 30 : Scale(48, width);
+    int topH  = g_isButtonPhone ? 20 : (g_topPanelY + TopBarHeight(width));
+    int mx    = Scale(10, width);
+    int itemH = Scale(26, width);
+    if (itemH < 18) itemH = 18;
+
+    int clipBottom = height - tabH;
+    HRGN clipRgn = CreateRectRgn(0, topH, width, clipBottom);
+    SelectClipRgn(hdc, clipRgn);
+
+    SetBkMode(hdc, TRANSPARENT);
+    int y = topH + Scale(8, width);
+
+    struct { LPCWSTR text; BOOL header; } items[] = {
+        { L"Yggstack",                          TRUE  },
+        { L"Version 1.2",                       FALSE },
+        { L"Windows Mobile 5/6",                FALSE },
+        { L"",                                  FALSE },
+        { L"Yggdrasil Network",                 TRUE  },
+        { L"IPv6 mesh networking",              FALSE },
+        { L"Ironwood protocol",                 FALSE },
+        { L"End-to-end encryption",             FALSE },
+        { L"",                                  FALSE },
+        { L"HTTP Proxy",                        TRUE  },
+        { L"127.0.0.1:8080",                    FALSE },
+        { L"For use with Opera browser",        FALSE },
+        { L"",                                  FALSE },
+        { L"Links",                             TRUE  },
+        { L"github.com/tribetmen/YggStackWM",   FALSE },
+        { L"yggdrasil-network.github.io",       FALSE },
     };
-    int itemCount = sizeof(infoItems) / sizeof(infoItems[0]);
-    
-    for (int i = 0; i < itemCount; i++) {
-        int itemY = y - scrollY;
-        
-        if (wcslen(infoItems[i]) > 0 && infoItems[i][0] != L' ') {
-            HBRUSH sectionBrush = CreateSolidBrush(MY_COLOR_HIGHLIGHT);
-            RECT rcSection = {0, itemY, width, itemY + itemHeight};
-            FillRect(hdc, &rcSection, sectionBrush);
-            DeleteObject(sectionBrush);
-            SetTextColor(hdc, MY_COLOR_PRIMARY_DARK);
+    int n = sizeof(items)/sizeof(items[0]);
+
+    for (int i = 0; i < n; i++) {
+        if (!items[i].text[0]) { y += itemH/2; continue; }
+        int iy = y - scrollY;
+        if (items[i].header) {
+            SetTextColor(hdc, C_TEXT_LIGHT);
+            RECT rc = { mx, iy, width - mx, iy + itemH };
+            DrawText(hdc, items[i].text, -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            DrawDivider(hdc, mx, width - mx, iy + itemH - 1, C_BORDER);
         } else {
-            SetTextColor(hdc, MY_COLOR_TEXT);
+            SetTextColor(hdc, C_TEXT);
+            RECT rc = { mx + Scale(12,width), iy, width - mx, iy + itemH };
+            DrawText(hdc, items[i].text, -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         }
-        
-        RECT rcItem = {margin, itemY + 2, width - margin, itemY + itemHeight - 2};
-        DrawText(hdc, infoItems[i], -1, &rcItem, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        y += itemHeight;
+        y += itemH;
     }
-    
+
     SelectClipRgn(hdc, NULL);
-    DeleteObject(hClipRgn);
-    
-    g_totalHeight = y + 20 - (g_isButtonPhone ? 22 : (g_topPanelY + 50));
-    int visibleHeight = g_isButtonPhone ? (height - 52) : (height - (g_topPanelY + 40 + panelHeight));
-    int maxScroll = max(0, g_totalHeight - visibleHeight);
-    Scroll_SetBounds(&g_scroll, 0, 0, 0, maxScroll);
+    DeleteObject(clipRgn);
+
+    int maxSc = (y + 20 > clipBottom) ? y + 20 - clipBottom : 0;
+    Scroll_SetBounds(&g_scroll, 0, 0, 0, maxSc);
 }
 
+// ============================================================================
+// Главная функция отрисовки
+// ============================================================================
+
 void DrawInterface(HDC hdc, int width, int height) {
-    HBRUSH whiteBrush = CreateSolidBrush(MY_COLOR_BG);
-    RECT rcClient = {0, 0, width, height};
-    FillRect(hdc, &rcClient, whiteBrush);
-    DeleteObject(whiteBrush);
-    
+    // Серый фон
+    HBRUSH bgBr = CreateSolidBrush(C_BG);
+    RECT rcAll  = { 0, 0, width, height };
+    FillRect(hdc, &rcAll, bgBr);
+    DeleteObject(bgBr);
+
     DrawTopPanel(hdc, width);
-    
+
     int scrollY = g_scroll.y;
-    
-    switch(g_currentTab) {
+    switch (g_currentTab) {
         case 0: DrawConfigTab(hdc, width, height, scrollY); break;
-        case 1: DrawLogsTab(hdc, width, height, scrollY); break;
-        case 2: DrawInfoTab(hdc, width, height, scrollY); break;
+        case 1: DrawLogsTab(hdc, width, height, scrollY);   break;
+        case 2: DrawInfoTab(hdc, width, height, scrollY);    break;
     }
-    
+
     DrawBottomPanel(hdc, width, height);
 }

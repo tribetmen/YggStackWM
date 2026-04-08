@@ -41,6 +41,7 @@
 #define ID_TIMER_BUTTON_PULSE  1004
 #define ID_TIMER_SPINNER       1006
 #define ID_TIMER_MULTITAP      1007
+#define ID_TIMER_HIDE_SIP      1008
 
 // Цвета
 #define MY_COLOR_PRIMARY     RGB(41, 98, 255)
@@ -111,6 +112,18 @@ int g_peerCount = 1;
 WCHAR g_newPeer[128] = L"";
 WCHAR g_tempKey[256] = L"";
 WCHAR g_connectPeerAddress[128] = L"";
+// DNS-серверы Yggdrasil (первый — основной, остальные — fallback)
+WCHAR g_dnsServers[8][64] = {
+    L"308:25:40:bd::",   // Bratislava, SK
+    L"308:62:45:62::",   // Amsterdam, NL
+    L"308:84:68:55::",   // Frankfurt, DE
+    L"308:c8:48:45::",   // Buffalo, US
+};
+int g_dnsCount = 4;
+WCHAR g_newDns[64] = L"";
+BOOL g_addingDns = FALSE;
+// Алиас для совместимости с YggNet (основной сервер)
+WCHAR g_yggDnsServerUI[64] = L"308:25:40:bd::";
 
 // Ядро Yggdrasil
 CYggdrasilCore* g_pYggCore = NULL;
@@ -278,6 +291,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             
         case WM_TIMER:
             switch(wParam) {
+                case ID_TIMER_HIDE_SIP:
+                    KillTimer(hWnd, ID_TIMER_HIDE_SIP);
+                    SipShowIM(SIPF_OFF);
+                    SHFullScreen(hWnd, SHFS_HIDESIPBUTTON);
+                    break;
                 case ID_TIMER_SPINNER:
                     g_spinnerAngle = (g_spinnerAngle + 15) % 360;
                     InvalidateRect(hWnd, NULL, FALSE);
@@ -364,12 +382,40 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
                 return 0;
             }
+            if (g_addingDns && !g_isButtonPhone) {
+                int len = wcslen(g_newDns);
+                if (wParam == VK_BACK && len > 0) {
+                    g_newDns[len - 1] = 0;
+                    InvalidateRect(hWnd, NULL, TRUE);
+                } else if (wParam == VK_RETURN) {
+                    if (len > 0 && g_dnsCount < 8) {
+                        wcscpy(g_dnsServers[g_dnsCount], g_newDns);
+                        g_dnsCount++;
+                        AddLog(L"DNS server added", LOG_SUCCESS);
+                        extern void SaveConfig();
+                        SaveConfig();
+                    }
+                    g_addingDns = FALSE;
+                    g_newDns[0] = 0;
+                    ShowKeyboard(FALSE);
+                    InvalidateRect(hWnd, NULL, TRUE);
+                } else if (len < 63) {
+                    g_newDns[len] = (WCHAR)wParam;
+                    g_newDns[len + 1] = 0;
+                    InvalidateRect(hWnd, NULL, TRUE);
+                }
+                return 0;
+            }
             break;
             
         case WM_USER + 100: // WM_CONNECT_COMPLETE
             OnConnectComplete();
             return 0;
             
+        case WM_USER + 200: // Запрос скрыть SIP после восстановления из SW_HIDE
+            SetTimer(hWnd, ID_TIMER_HIDE_SIP, 300, NULL);
+            return 0;
+
         case WM_USER + 101: // WM_CONNECT_FAILED
             OnConnectFailed();
             return 0;
@@ -383,22 +429,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_ACTIVATE:
             // Стандартная обработка для Windows Mobile
             SHHandleWMActivate(hWnd, wParam, lParam, NULL, 0);
-            
+
             if (LOWORD(wParam) == WA_INACTIVE) {
                 ShowKeyboard(FALSE);
                 g_editingKey = FALSE;
                 g_addingPeer = FALSE;
+                g_addingDns = FALSE;
                 if (!g_bManualMinimize) {
                     PostQuitMessage(0);
                     return 0;
                 }
                 g_bManualMinimize = FALSE;
             } else if (LOWORD(wParam) == WA_ACTIVE || LOWORD(wParam) == WA_CLICKACTIVE) {
-                // При активации окна принудительно скрываем клавиатуру
-                // чтобы не оставалась иконка клавиатуры внизу экрана
                 ShowKeyboard(FALSE);
-                // Принудительно скрываем SIP полностью
-                SipShowIM(SIPF_OFF);
             }
             break;
             
@@ -458,8 +501,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPWSTR lpCmdLine, int nCmdShow) {
     HWND hExistingWnd = FindWindow(L"YggstackClass", NULL);
     if (hExistingWnd != NULL) {
-        SetForegroundWindow(hExistingWnd);
         ShowWindow(hExistingWnd, SW_SHOW);
+        SetForegroundWindow(hExistingWnd);
+        // Просим уже запущенный процесс скрыть SIP после получения фокуса
+        PostMessage(hExistingWnd, WM_USER + 200, 0, 0);
         return 0;
     }
 
@@ -470,7 +515,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     
     // Инициализация системы логирования (после Winsock, до использования логов)
     InitLogSystem();
-    
+
+    // Загружаем конфиг (ключи, пиры, DNS-сервер) до показа UI
+    LoadConfig();
+
     g_hInst = hInstance;
     
     WNDCLASS wc = {0};
@@ -508,7 +556,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     if (!g_hWnd) {
         return 0;
     }
-    
+
     ShowWindow(g_hWnd, nCmdShow);
     UpdateWindow(g_hWnd);
     

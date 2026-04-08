@@ -52,6 +52,10 @@ extern WCHAR g_privateKeyFull[128];
 extern WCHAR g_privateKeyShort[64];
 extern BOOL g_showSpinner;
 extern int g_spinnerAngle;
+extern WCHAR g_dnsServers[8][64];
+extern int g_dnsCount;
+extern WCHAR g_newDns[64];
+extern BOOL g_addingDns;
 
 // Буфер логов
 #define LOG_BUFFER_SIZE 200

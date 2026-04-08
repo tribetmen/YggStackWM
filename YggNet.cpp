@@ -23,6 +23,9 @@ extern WCHAR g_peersList[10][128];
 extern int g_peerCount;
 extern WCHAR g_privateKeyFull[128];
 extern WCHAR g_privateKeyShort[64];
+extern WCHAR g_yggDnsServerUI[64];
+extern WCHAR g_dnsServers[8][64];
+extern int g_dnsCount;
 
 // Таймеры
 #define ID_TIMER_SPINNER       1006
@@ -189,27 +192,88 @@ void LoadOrGenerateKeys() {
 void SaveConfig(void) {
     HKEY hKey;
     DWORD dwDisp;
-    
+
     // Создаем/открываем ключ реестра
     if (RegCreateKeyEx(HKEY_CURRENT_USER, L"Software\\Yggdrasil", 0, NULL, 0, KEY_WRITE, NULL, &hKey, &dwDisp) == ERROR_SUCCESS) {
         // Сохраняем приватный ключ
         RegSetValueEx(hKey, L"PrivateKey", 0, REG_SZ, (BYTE*)g_privateKeyFull, (wcslen(g_privateKeyFull) + 1) * sizeof(WCHAR));
-        
+
         // Сохраняем количество пиров
         RegSetValueEx(hKey, L"PeerCount", 0, REG_DWORD, (BYTE*)&g_peerCount, sizeof(DWORD));
-        
+
         // Сохраняем список пиров
         for (int i = 0; i < g_peerCount && i < 10; i++) {
             WCHAR peerName[32];
             wsprintf(peerName, L"Peer%d", i);
             RegSetValueEx(hKey, peerName, 0, REG_SZ, (BYTE*)g_peersList[i], (wcslen(g_peersList[i]) + 1) * sizeof(WCHAR));
         }
-        
+
+        // Сохраняем список DNS-серверов
+        RegSetValueEx(hKey, L"DnsCount", 0, REG_DWORD, (BYTE*)&g_dnsCount, sizeof(DWORD));
+        for (int i = 0; i < g_dnsCount && i < 8; i++) {
+            WCHAR dnsName[32];
+            wsprintf(dnsName, L"Dns%d", i);
+            RegSetValueEx(hKey, dnsName, 0, REG_SZ,
+                (BYTE*)g_dnsServers[i], (wcslen(g_dnsServers[i]) + 1) * sizeof(WCHAR));
+        }
+
         RegCloseKey(hKey);
         AddLog(L"Config saved", LOG_SUCCESS);
     } else {
         AddLog(L"Failed to save config", LOG_ERROR);
     }
+}
+
+void LoadConfig(void) {
+    HKEY hKey;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Software\\Yggdrasil", 0, KEY_READ, &hKey) != ERROR_SUCCESS)
+        return;
+
+    // Загружаем количество пиров
+    DWORD type, size;
+    DWORD peerCount = 0;
+    size = sizeof(DWORD);
+    if (RegQueryValueEx(hKey, L"PeerCount", NULL, &type, (BYTE*)&peerCount, &size) == ERROR_SUCCESS) {
+        if (peerCount > 10) peerCount = 10;
+        g_peerCount = (int)peerCount;
+    }
+
+    // Загружаем список пиров
+    for (int i = 0; i < g_peerCount; i++) {
+        WCHAR peerName[32];
+        wsprintf(peerName, L"Peer%d", i);
+        WCHAR peerAddr[128];
+        DWORD peerSize = sizeof(peerAddr);
+        if (RegQueryValueEx(hKey, peerName, NULL, &type, (BYTE*)peerAddr, &peerSize) == ERROR_SUCCESS) {
+            wcsncpy(g_peersList[i], peerAddr, 127);
+            g_peersList[i][127] = L'\0';
+        }
+    }
+
+    // Загружаем список DNS-серверов
+    DWORD dnsCount = 0;
+    size = sizeof(DWORD);
+    if (RegQueryValueEx(hKey, L"DnsCount", NULL, &type, (BYTE*)&dnsCount, &size) == ERROR_SUCCESS && dnsCount > 0) {
+        if (dnsCount > 8) dnsCount = 8;
+        g_dnsCount = 0;
+        for (int i = 0; i < (int)dnsCount; i++) {
+            WCHAR dnsName[32];
+            wsprintf(dnsName, L"Dns%d", i);
+            WCHAR dnsAddr[64];
+            DWORD dnsSize = sizeof(dnsAddr);
+            if (RegQueryValueEx(hKey, dnsName, NULL, &type, (BYTE*)dnsAddr, &dnsSize) == ERROR_SUCCESS) {
+                wcsncpy(g_dnsServers[g_dnsCount], dnsAddr, 63);
+                g_dnsServers[g_dnsCount][63] = L'\0';
+                g_dnsCount++;
+            }
+        }
+        if (g_dnsCount > 0) {
+            wcsncpy(g_yggDnsServerUI, g_dnsServers[0], 63);
+            g_yggDnsServerUI[63] = L'\0';
+        }
+    }
+
+    RegCloseKey(hKey);
 }
 
 // ============================================================================

@@ -92,6 +92,7 @@ CYggdrasilCore* CYggdrasilCore::s_pInstance = NULL;
 
 CYggdrasilCore::CYggdrasilCore() {
     memset(&m_keys, 0, sizeof(m_keys));
+    memset(m_xPrivKey, 0, sizeof(m_xPrivKey));
     InitializeCriticalSection(&m_peersLock);
 }
 
@@ -118,18 +119,52 @@ void CYggdrasilCore::DestroyInstance() {
 // ИНИЦИАЛИЗАЦИЯ
 // ============================================================================
 
+// Записывает TCP-параметры в реестр WinCE для увеличения receive window.
+// WinCE игнорирует setsockopt(SO_RCVBUF) но читает эти значения при старте стека.
+// Требует перезагрузки для вступления в силу, но мы пишем при каждом старте на случай сброса.
+static void TuneTcpRegistry() {
+    HKEY hKey = NULL;
+    DWORD dwDisp = 0;
+    // Comm\Tcpip\Parms — системные параметры TCP стека WinCE
+    if (RegCreateKeyEx(HKEY_LOCAL_MACHINE, L"Comm\\Tcpip\\Parms", 0, NULL, 0,
+                       KEY_WRITE, NULL, &hKey, &dwDisp) == ERROR_SUCCESS) {
+        // Для high latency сетей (ping 1700ms) нужно максимальное окно
+        // WinCE обычно ограничивает ~64KB, но пробуем больше
+        DWORD rcvWin = 128 * 1024;  // 128KB для high latency
+        DWORD sndWin = 128 * 1024;  // 128KB для отправки тоже
+        RegSetValueEx(hKey, L"DefaultRcvWindow", 0, REG_DWORD, (BYTE*)&rcvWin, sizeof(DWORD));
+        RegSetValueEx(hKey, L"DefaultSndWindow", 0, REG_DWORD, (BYTE*)&sndWin, sizeof(DWORD));
+        RegSetValueEx(hKey, L"MaxRcvWindow",     0, REG_DWORD, (BYTE*)&rcvWin, sizeof(DWORD));
+        RegSetValueEx(hKey, L"MaxSndWindow",     0, REG_DWORD, (BYTE*)&sndWin, sizeof(DWORD));
+        RegSetValueEx(hKey, L"TcpWindowSize",    0, REG_DWORD, (BYTE*)&rcvWin, sizeof(DWORD));
+        // Включаем TCP window scaling (если поддерживается)
+        DWORD scaling = 1;
+        RegSetValueEx(hKey, L"TcpWindowScaling", 0, REG_DWORD, (BYTE*)&scaling, sizeof(DWORD));
+        // Увеличиваем максимальное количество соединений
+        DWORD maxConn = 256;
+        RegSetValueEx(hKey, L"MaxConnections",   0, REG_DWORD, (BYTE*)&maxConn, sizeof(DWORD));
+        RegCloseKey(hKey);
+        AddLog(L"[TCP] Registry: Rcv/Snd Window=128KB, Scaling=On written", LOG_INFO);
+    } else {
+        AddLog(L"[TCP] Registry: failed to write Tcpip\\Parms (need admin?)", LOG_WARN);
+    }
+}
+
 bool CYggdrasilCore::Initialize() {
+    // Настраиваем TCP receive window через реестр (WinCE игнорирует setsockopt)
+    TuneTcpRegistry();
+
     // Инициализация криптографии
     if (!YggCrypto::Initialize()) {
         return false;
     }
-    
+
     // Тесты криптографии отключены в продакшн-сборке
     // YggCrypto::RunCryptoTests();
-    
+
     // Инициализация пула предгенерированных ключей
     IronSession::InitKeyPool();
-    
+
     return true;
 }
 
@@ -164,7 +199,17 @@ bool CYggdrasilCore::LoadOrGenerateKeys() {
         if (hasPriv && hasPub && privLen == 64 && pubLen == 32) {
             memcpy(m_keys.privateKey, privKey, 64);
             memcpy(m_keys.publicKey, pubKey, 32);
-            
+
+            // Вычисляем X25519 private key один раз (SHA-512 от seed)
+            {
+                BYTE hash[64];
+                crypto_hash_sha512_tweet(hash, m_keys.privateKey, 32);
+                memcpy(m_xPrivKey, hash, 32);
+                m_xPrivKey[0] &= 248;
+                m_xPrivKey[31] &= 127;
+                m_xPrivKey[31] |= 64;
+            }
+
             YggCrypto::DeriveIPv6(m_keys.ipv6, m_keys.publicKey);
             
             // Выводим полный ключ и IPv6 для отладки
@@ -211,6 +256,16 @@ bool CYggdrasilCore::LoadOrGenerateKeys() {
     
     
     
+    // Вычисляем X25519 private key один раз (SHA-512 от seed)
+    {
+        BYTE hash[64];
+        crypto_hash_sha512_tweet(hash, m_keys.privateKey, 32);
+        memcpy(m_xPrivKey, hash, 32);
+        m_xPrivKey[0] &= 248;
+        m_xPrivKey[31] &= 127;
+        m_xPrivKey[31] |= 64;
+    }
+
     // Получаем IPv6 из публичного ключа
     YggCrypto::DeriveIPv6(m_keys.ipv6, m_keys.publicKey);
     
@@ -261,6 +316,10 @@ WCHAR* CYggdrasilCore::GetIPv6String(WCHAR* buffer, int maxLen) {
 // ============================================================================
 // УПРАВЛЕНИЕ ПИРАМИ
 // ============================================================================
+
+bool CYggdrasilCore::ParseIPv6(LPCWSTR ipv6Str, BYTE* outBytes) {
+    return ParseIPv6String(ipv6Str, outBytes);
+}
 
 IronPeer* CYggdrasilCore::ConnectToPeer(LPCWSTR peerAddress, int port) {
     char host[256];
@@ -317,7 +376,21 @@ IronPeer* CYggdrasilCore::ConnectToPeer(LPCWSTR peerAddress, int port) {
     // Отключаем Nagle algorithm для минимальной задержки
     int flag = 1;
     setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
+
+    // Большие буферы для транспортного TCP — увеличивает receive window и throughput
+    int bufSize = 256 * 1024;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char*)&bufSize, sizeof(bufSize));
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&bufSize, sizeof(bufSize));
     
+    // Проверяем фактические размеры буферов
+    int actualRcv = 0, actualSnd = 0;
+    int optlen = sizeof(int);
+    getsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char*)&actualRcv, &optlen);
+    getsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&actualSnd, &optlen);
+    WCHAR dbg[128];
+    wsprintf(dbg, L"[TCP] Socket buffers: RCV=%d KB, SND=%d KB", actualRcv/1024, actualSnd/1024);
+    AddLog(dbg, LOG_INFO);
+
     // Устанавливаем неблокирующий режим
     u_long mode = 1;
     ioctlsocket(sock, FIONBIO, &mode);

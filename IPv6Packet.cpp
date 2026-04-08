@@ -225,3 +225,86 @@ int IPv6Packet::getTCPFlags(const BYTE* ipv6Packet, DWORD len) {
     }
     return ipv6Packet[40 + 13] & 0xFF;
 }
+
+// ============================================================================
+// UDP over IPv6
+// ============================================================================
+
+vector<BYTE> IPv6Packet::wrapUDP(const BYTE* srcAddr, const BYTE* dstAddr,
+                                  WORD srcPort, WORD dstPort,
+                                  const BYTE* data, DWORD dataLen) {
+    // UDP header: 8 байт
+    WORD udpLen = (WORD)(8 + dataLen);
+
+    // Checksum: псевдозаголовок IPv6 + UDP
+    DWORD sum = 0;
+    for (int i = 0; i < 16; i += 2) {
+        sum += ((WORD)srcAddr[i] << 8) | srcAddr[i + 1];
+        sum += ((WORD)dstAddr[i] << 8) | dstAddr[i + 1];
+    }
+    sum += 17;       // Next Header = UDP
+    sum += udpLen;   // UDP length (header + data)
+    // UDP header fields (кроме checksum)
+    sum += srcPort;
+    sum += dstPort;
+    sum += udpLen;
+    // 0x0000 checksum field — не добавляем
+    // Data
+    for (DWORD i = 0; i < dataLen; i += 2) {
+        WORD w = (WORD)((data[i] << 8));
+        if (i + 1 < dataLen) w |= data[i + 1];
+        sum += w;
+    }
+    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    WORD checksum = (WORD)(~sum & 0xFFFF);
+    if (checksum == 0) checksum = 0xFFFF; // UDP: 0x0000 зарезервировано для "нет checksum"
+    
+    // DEBUG: Отключаем checksum для теста (временно!)
+    // checksum = 0x0000;
+
+    // Собираем пакет: IPv6 header (40) + UDP header (8) + data
+    vector<BYTE> packet;
+    packet.reserve(40 + 8 + dataLen);
+
+    // IPv6 header - копируем Traffic Class/Flow Label из исходного пакета если есть
+    // Или используем нули (как большинство реализаций)
+    packet.push_back(0x60); packet.push_back(0x00);
+    packet.push_back(0x00); packet.push_back(0x00);
+    packet.push_back((BYTE)(udpLen >> 8)); packet.push_back((BYTE)(udpLen & 0xFF));
+    packet.push_back(0x11); // Next Header = UDP
+    packet.push_back(128);  // Hop Limit (было 64, увеличил до 128 для Yggdrasil)
+    packet.insert(packet.end(), srcAddr, srcAddr + 16);
+    packet.insert(packet.end(), dstAddr, dstAddr + 16);
+
+    // UDP header
+    packet.push_back((BYTE)(srcPort >> 8)); packet.push_back((BYTE)(srcPort & 0xFF));
+    packet.push_back((BYTE)(dstPort >> 8)); packet.push_back((BYTE)(dstPort & 0xFF));
+    packet.push_back((BYTE)(udpLen >> 8));  packet.push_back((BYTE)(udpLen & 0xFF));
+    packet.push_back((BYTE)(checksum >> 8)); packet.push_back((BYTE)(checksum & 0xFF));
+
+    if (dataLen > 0 && data != NULL)
+        packet.insert(packet.end(), data, data + dataLen);
+
+    return packet;
+}
+
+bool IPv6Packet::unwrapUDP(const BYTE* ipv6Packet, DWORD len,
+                            WORD& outSrcPort, WORD& outDstPort,
+                            const BYTE*& outData, DWORD& outDataLen) {
+    if (!ipv6Packet || len < 48) return false;           // 40 IPv6 + 8 UDP
+    if ((ipv6Packet[0] & 0xF0) != 0x60) return false;   // не IPv6
+    if (ipv6Packet[6] != 0x11) return false;             // не UDP
+
+    WORD payloadLen = ((WORD)ipv6Packet[4] << 8) | ipv6Packet[5];
+    if (payloadLen < 8 || len < 40u + payloadLen) return false;
+
+    const BYTE* udp = ipv6Packet + 40;
+    outSrcPort  = ((WORD)udp[0] << 8) | udp[1];
+    outDstPort  = ((WORD)udp[2] << 8) | udp[3];
+    WORD udpLen = ((WORD)udp[4] << 8) | udp[5];
+    if (udpLen < 8 || udpLen > payloadLen) return false;
+
+    outData    = udp + 8;
+    outDataLen = udpLen - 8;
+    return true;
+}
